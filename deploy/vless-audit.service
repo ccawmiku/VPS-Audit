@@ -1,0 +1,25 @@
+[Unit]
+Description=VLESS Passive Traffic & Domain Auditor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vless-audit
+Group=vless-audit
+ExecStart=/usr/local/bin/vless-audit --iface eth0 --listen 127.0.0.1:18080 --db-path /var/lib/vless-audit/audit.db
+Restart=on-failure
+RestartSec=3
+
+# Dedicated non-root service with only CAP_NET_RAW for AF_PACKET
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+StateDirectory=vless-audit
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

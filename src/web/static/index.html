@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VLESS 旁路流量审计 · Azure 东京 A1</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --panel: #111827;
+      --panel-2: #161f33;
+      --border: #243047;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --rx: #22c55e;
+      --tx: #60a5fa;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1220px; margin: 0 auto; padding: 20px 16px 48px; }
+    header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start;
+      gap: 12px; margin-bottom: 16px;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+    .subtitle { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 9px; border-radius: 999px; font-size: 12px;
+      background: rgba(56, 189, 248, 0.12); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.28);
+    }
+    .badge.warn {
+      background: rgba(245, 158, 11, 0.12); color: var(--warn); border-color: rgba(245, 158, 11, 0.3);
+    }
+    .badge.ok {
+      background: rgba(34, 197, 94, 0.12); color: var(--rx); border-color: rgba(34, 197, 94, 0.3);
+    }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; margin-bottom: 16px;
+    }
+    .btn {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: 7px; cursor: pointer; font-size: 13px;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn.active { background: rgba(56, 189, 248, 0.18); border-color: var(--accent); color: #fff; font-weight: 600; }
+    .custom-range { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: auto; }
+    input[type="datetime-local"], input[type="search"] {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      padding: 5px 9px; border-radius: 6px; font-size: 12px; color-scheme: dark;
+    }
+    .cards {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px; margin-bottom: 16px;
+    }
+    .card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+    }
+    .card-label { color: var(--muted); font-size: 12px; }
+    .card-val {
+      font-size: 24px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums;
+    }
+    .card-sub { color: var(--muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 14px 16px; margin-bottom: 16px;
+    }
+    .panel-head {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 10px; margin-bottom: 12px;
+    }
+    .panel-title { font-size: 15px; font-weight: 600; margin: 0; }
+    .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); align-items: center; }
+    .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+    .chart-box { position: relative; width: 100%; overflow: hidden; }
+    svg#timelineSvg { width: 100%; height: 220px; display: block; }
+    .tooltip {
+      position: fixed; pointer-events: none; z-index: 50;
+      background: rgba(15, 23, 42, 0.96); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 10px; font-size: 12px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45); display: none;
+      font-variant-numeric: tabular-nums;
+    }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-size: 12px; font-weight: 600; }
+    td.num, th.num { text-align: right; }
+    tr.rank-row { cursor: pointer; }
+    tr.rank-row:hover { background: rgba(255, 255, 255, 0.03); }
+    tr.detail-row td { background: #0d1526; padding: 10px 14px; }
+    .bar-bg {
+      width: 100%; max-width: 130px; height: 7px; background: #1e293b; border-radius: 99px;
+      overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px;
+    }
+    .bar-fill { height: 100%; background: linear-gradient(90deg, var(--rx), var(--tx)); }
+    .tag {
+      display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px;
+      background: #1e293b; color: #cbd5e1; margin-left: 6px;
+    }
+    .tag.ech { background: rgba(245, 158, 11, 0.16); color: #fbbf24; }
+    .mono { font-family: var(--mono); }
+    .status-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px; font-size: 12px;
+    }
+    .status-item {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    }
+    .status-k { color: var(--muted); }
+    .status-v { font-family: var(--mono); font-size: 13px; margin-top: 2px; word-break: break-all; }
+    .tabs { display: flex; gap: 8px; }
+    .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>VLESS 旁路流量审计 <span class="badge">出站 TCP 80/443 负载估算</span></h1>
+        <div class="subtitle">
+          仅统计本机主动出站 TCP 80/443 负载（不含 QUIC/UDP、非 80/443 端口及 IPv6），数值与云厂商配额口径略有差异；展示时间为北京时间 (UTC+8)。
+        </div>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span id="cfUserBadge" class="badge ok" style="display:none;"></span>
+        <span id="liveBadge" class="badge">加载中...</span>
+        <button class="btn" id="refreshBtn">立即刷新</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <button class="btn" data-preset="1h">最近 1 小时</button>
+      <button class="btn" data-preset="today">今天</button>
+      <button class="btn active" data-preset="24h">最近 24 小时</button>
+      <button class="btn" data-preset="7d">最近 7 天</button>
+      <span id="drillBadge" class="badge warn" style="display:none; cursor:pointer;" title="点击清除时段下钻"></span>
+      <div class="custom-range">
+        <input type="datetime-local" id="fromInput" />
+        <span style="color:var(--muted);">至</span>
+        <input type="datetime-local" id="toInput" />
+        <button class="btn" id="applyCustomBtn">查询</button>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">估算下行流量 (RX)</div>
+        <div class="card-val" id="sumRx">-</div>
+        <div class="card-sub" id="sumTotalSub">总计: -</div>
+      </div>
+      <div class="card">
+        <div class="card-label">估算上行流量 (TX)</div>
+        <div class="card-val" id="sumTx">-</div>
+        <div class="card-sub" id="sumConns">已见连接: -</div>
+      </div>
+      <div class="card">
+        <div class="card-label">「未识别」流量占比</div>
+        <div class="card-val" id="sumUnid">-</div>
+        <div class="card-sub" id="sumUnidSub">-</div>
+      </div>
+      <div class="card">
+        <div class="card-label">活跃主域名数</div>
+        <div class="card-val" id="sumDomains">-</div>
+        <div class="card-sub" id="sumWindow">时间窗: -</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">分时段流量走势（点击柱子可下钻该时段）</h2>
+        <div class="legend">
+          <span><i class="dot" style="background:var(--rx)"></i>下行 RX</span>
+          <span><i class="dot" style="background:var(--tx)"></i>上行 TX</span>
+          <span id="stepLabel" class="mono"></span>
+        </div>
+      </div>
+      <div class="chart-box">
+        <svg id="timelineSvg" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="tabs">
+          <button class="btn active" id="tabDomainsBtn">主域名排行（点击行展开子域名）</button>
+          <button class="btn" id="tabRecentBtn">最近访问明细</button>
+        </div>
+        <input type="search" id="domainFilter" placeholder="搜索域名或服务标签..." style="min-width:220px;" />
+      </div>
+
+      <div id="domainsPane">
+        <table>
+          <thead>
+            <tr>
+              <th>主域名 / 归类</th>
+              <th class="num">下行 (RX)</th>
+              <th class="num">上行 (TX)</th>
+              <th class="num">合计</th>
+              <th>占比</th>
+              <th class="num">连接数</th>
+            </tr>
+          </thead>
+          <tbody id="domainsBody"></tbody>
+        </table>
+      </div>
+
+      <div id="recentPane" style="display:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>最后活跃 (北京时间)</th>
+              <th>完整域名</th>
+              <th>主域名</th>
+              <th class="num">下行 (RX)</th>
+              <th class="num">上行 (TX)</th>
+              <th class="num">连接数</th>
+            </tr>
+          </thead>
+          <tbody id="recentBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">采集健康与覆盖范围</h2>
+        <span class="subtitle" id="coverageNote"></span>
+      </div>
+      <div class="status-grid" id="statusGrid"></div>
+    </div>
+  </div>
+
+  <div class="tooltip" id="tooltip"></div>
+
+  <script>
+    const fmtBJFull = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+    const fmtBJShort = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    });
+
+    function fmtTime(sec, short = false) {
+      if (!sec) return '-';
+      return (short ? fmtBJShort : fmtBJFull).format(new Date(sec * 1000));
+    }
+
+    function fmtBytes(b) {
+      if (b === null || b === undefined) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let v = Number(b);
+      let i = 0;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return (i === 0 ? v.toFixed(0) : v.toFixed(2)) + ' ' + units[i];
+    }
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    function toBJLocalInput(sec) {
+      // Shift by +8h to populate datetime-local input in Beijing wall time
+      const d = new Date((sec + 8 * 3600) * 1000);
+      return d.toISOString().slice(0, 16);
+    }
+
+    function parseBJLocalInput(val) {
+      if (!val) return null;
+      // Treat input string as UTC+8
+      const ms = Date.parse(val + '+08:00');
+      return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+    }
+
+    let state = {
+      preset: '24h',
+      from: 0,
+      to: 0,
+      drillFrom: null,
+      drillTo: null,
+      overview: null,
+      expandedRoot: null,
+      tab: 'domains'
+    };
+
+    function applyPreset(preset) {
+      state.preset = preset;
+      state.drillFrom = null;
+      state.drillTo = null;
+      const now = Math.floor(Date.now() / 1000);
+      let from = now - 86400;
+      if (preset === '1h') from = now - 3600;
+      else if (preset === '24h') from = now - 86400;
+      else if (preset === '7d') from = now - 7 * 86400;
+      else if (preset === 'today') {
+        const bjNow = new Date((now + 8 * 3600) * 1000);
+        const dayStartUtc = Date.UTC(bjNow.getUTCFullYear(), bjNow.getUTCMonth(), bjNow.getUTCDate()) / 1000 - 8 * 3600;
+        from = dayStartUtc;
+      }
+      state.from = from;
+      state.to = now;
+      document.getElementById('fromInput').value = toBJLocalInput(from);
+      document.getElementById('toInput').value = toBJLocalInput(now);
+      document.querySelectorAll('[data-preset]').forEach(el => {
+        el.classList.toggle('active', el.dataset.preset === preset);
+      });
+      loadAll();
+    }
+
+    async function loadAll() {
+      const qFrom = state.drillFrom ?? state.from;
+      const qTo = state.drillTo ?? state.to;
+      const drillBadge = document.getElementById('drillBadge');
+      if (state.drillFrom !== null) {
+        drillBadge.style.display = 'inline-flex';
+        drillBadge.textContent = `下钻时段: ${fmtTime(qFrom, true)} ~ ${fmtTime(qTo, true)} (点击退出)`;
+      } else {
+        drillBadge.style.display = 'none';
+      }
+
+      const [ovRes, stRes, recRes] = await Promise.all([
+        fetch(`/api/overview?from=${qFrom}&to=${qTo}`),
+        fetch('/api/status'),
+        state.tab === 'recent' ? fetch('/api/recent?limit=150') : Promise.resolve(null)
+      ]);
+
+      const ov = await ovRes.json();
+      state.overview = ov;
+      renderOverview(ov);
+
+      const st = await stRes.json();
+      renderStatus(st);
+
+      if (recRes) {
+        const rec = await recRes.json();
+        renderRecent(rec);
+      }
+    }
+
+    function renderOverview(ov) {
+      const s = ov.summary;
+      document.getElementById('sumRx').textContent = fmtBytes(s.total_rx_bytes);
+      document.getElementById('sumTx').textContent = fmtBytes(s.total_tx_bytes);
+      document.getElementById('sumTotalSub').textContent = `双向合计: ${fmtBytes(s.total_rx_bytes + s.total_tx_bytes)}`;
+      document.getElementById('sumConns').textContent = `已见连接: ${s.total_conns}`;
+      document.getElementById('sumUnid').textContent = `${s.unidentified_ratio_pct.toFixed(2)}%`;
+      document.getElementById('sumUnidSub').textContent =
+        `下行 ${fmtBytes(s.unidentified_rx_bytes)} / 上行 ${fmtBytes(s.unidentified_tx_bytes)}`;
+      document.getElementById('sumDomains').textContent = String(s.active_root_domains);
+      document.getElementById('sumWindow').textContent = `${fmtTime(s.from_ts, true)} ~ ${fmtTime(s.to_ts, true)}`;
+      document.getElementById('stepLabel').textContent = `粒度: ${Math.round(s.step_secs / 60)} 分钟`;
+
+      renderChart(ov.timeline, s.step_secs);
+      renderDomainsTable();
+    }
+
+    function renderChart(points, stepSecs) {
+      const svg = document.getElementById('timelineSvg');
+      const tip = document.getElementById('tooltip');
+      if (!points || points.length === 0) {
+        svg.innerHTML = '<text x="500" y="110" text-anchor="middle" fill="#64748b" font-size="14">当前时间段暂无流量记录</text>';
+        return;
+      }
+
+      const W = 1000, H = 220, padL = 58, padR = 14, padT = 14, padB = 28;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+      const maxVal = Math.max(1, ...points.map(p => p.rx_bytes + p.tx_bytes));
+      const barStep = plotW / points.length;
+      const barW = Math.max(2, Math.min(28, barStep * 0.72));
+
+      let html = '';
+      // Grid lines (0%, 50%, 100%)
+      for (const ratio of [0, 0.5, 1]) {
+        const y = padT + plotH * (1 - ratio);
+        html += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#1e293b" stroke-width="1"/>`;
+        html += `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" fill="#64748b" font-size="10">${esc(fmtBytes(maxVal * ratio))}</text>`;
+      }
+
+      points.forEach((p, idx) => {
+        const total = p.rx_bytes + p.tx_bytes;
+        const totalH = (total / maxVal) * plotH;
+        const rxH = (p.rx_bytes / maxVal) * plotH;
+        const txH = Math.max(0, totalH - rxH);
+        const x = padL + idx * barStep + (barStep - barW) / 2;
+        const yRx = padT + plotH - rxH;
+        const yTx = yRx - txH;
+
+        html += `<g class="bar-g" data-idx="${idx}" style="cursor:pointer;">`;
+        html += `<rect x="${x}" y="${padT}" width="${barW}" height="${plotH}" fill="transparent"/>`;
+        if (rxH > 0) html += `<rect x="${x}" y="${yRx}" width="${barW}" height="${rxH}" fill="#22c55e" rx="1"/>`;
+        if (txH > 0) html += `<rect x="${x}" y="${yTx}" width="${barW}" height="${txH}" fill="#60a5fa" rx="1"/>`;
+        html += `</g>`;
+      });
+
+      // X-axis labels (up to 6 evenly spaced)
+      const labelCount = Math.min(6, points.length);
+      for (let i = 0; i < labelCount; i++) {
+        const idx = labelCount === 1 ? 0 : Math.round((i * (points.length - 1)) / (labelCount - 1));
+        const p = points[idx];
+        const x = padL + idx * barStep + barStep / 2;
+        html += `<text x="${x}" y="${H - 8}" text-anchor="middle" fill="#64748b" font-size="10">${esc(fmtTime(p.ts, true))}</text>`;
+      }
+
+      svg.innerHTML = html;
+
+      svg.querySelectorAll('.bar-g').forEach(g => {
+        const idx = Number(g.dataset.idx);
+        const p = points[idx];
+        g.addEventListener('mousemove', e => {
+          tip.style.display = 'block';
+          tip.style.left = (e.clientX + 12) + 'px';
+          tip.style.top = (e.clientY - 12) + 'px';
+          tip.innerHTML = `
+            <div><strong>${esc(fmtTime(p.ts, false))}</strong></div>
+            <div>下行 RX: <span style="color:#22c55e">${esc(fmtBytes(p.rx_bytes))}</span></div>
+            <div>上行 TX: <span style="color:#60a5fa">${esc(fmtBytes(p.tx_bytes))}</span></div>
+            <div>未识别: ${esc(fmtBytes(p.unidentified_bytes))} · 连接: ${p.conn_count}</div>
+          `;
+        });
+        g.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+        g.addEventListener('click', () => {
+          state.drillFrom = p.ts;
+          state.drillTo = p.ts + stepSecs - 1;
+          loadAll();
+        });
+      });
+    }
+
+    function renderDomainsTable() {
+      const tbody = document.getElementById('domainsBody');
+      if (!state.overview) return;
+      const filter = document.getElementById('domainFilter').value.trim().toLowerCase();
+      const rows = state.overview.domains.filter(d => {
+        if (!filter) return true;
+        return d.root_domain.toLowerCase().includes(filter) ||
+          (d.service_label && d.service_label.toLowerCase().includes(filter));
+      });
+
+      if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">没有匹配的域名数据</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = rows.map(d => {
+        const tag = d.service_label ? `<span class="tag">${esc(d.service_label)}</span>` : '';
+        const isExpanded = state.expandedRoot === d.root_domain;
+        return `
+          <tr class="rank-row" data-root="${esc(d.root_domain)}">
+            <td>
+              <span class="mono">${esc(d.root_domain)}</span>${tag}
+            </td>
+            <td class="num">${esc(fmtBytes(d.rx_bytes))}</td>
+            <td class="num">${esc(fmtBytes(d.tx_bytes))}</td>
+            <td class="num"><strong>${esc(fmtBytes(d.total_bytes))}</strong></td>
+            <td>
+              <span class="bar-bg"><span class="bar-fill" style="width:${Math.min(100, d.share_pct).toFixed(1)}%"></span></span>
+              <span>${d.share_pct.toFixed(1)}%</span>
+            </td>
+            <td class="num">${d.conn_count}</td>
+          </tr>
+          ${isExpanded ? `<tr class="detail-row" id="detail-${esc(d.root_domain)}"><td colspan="6">加载子域名明细中...</td></tr>` : ''}
+        `;
+      }).join('');
+
+      tbody.querySelectorAll('.rank-row').forEach(tr => {
+        tr.addEventListener('click', async () => {
+          const root = tr.dataset.root;
+          if (state.expandedRoot === root) {
+            state.expandedRoot = null;
+            renderDomainsTable();
+            return;
+          }
+          state.expandedRoot = root;
+          renderDomainsTable();
+          await loadDomainDetails(root);
+        });
+      });
+
+      if (state.expandedRoot) {
+        loadDomainDetails(state.expandedRoot);
+      }
+    }
+
+    async function loadDomainDetails(root) {
+      const qFrom = state.drillFrom ?? state.from;
+      const qTo = state.drillTo ?? state.to;
+      const row = document.getElementById(`detail-${root}`);
+      if (!row) return;
+      const res = await fetch(`/api/domain/${encodeURIComponent(root)}/details?from=${qFrom}&to=${qTo}`);
+      const details = await res.json();
+      if (!details || details.length === 0) {
+        row.firstElementChild.innerHTML = '<span style="color:var(--muted)">暂无近期完整子域名明细（可能已超过保留期或为「未识别」流）</span>';
+        return;
+      }
+      row.firstElementChild.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>完整域名 (SNI / Host)</th>
+              <th class="num">下行 (RX)</th>
+              <th class="num">上行 (TX)</th>
+              <th class="num">连接数</th>
+              <th class="num">最后活跃 (北京时间)</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${details.map(sub => `
+              <tr>
+                <td class="mono">
+                  ${esc(sub.full_domain)}
+                  ${sub.ech_ext ? '<span class="tag ech" title="TLS 握手存在 0xfe0d 扩展（可能是真实 ECH 外层或浏览器 GREASE）">含0xfe0d(ECH/GREASE)</span>' : ''}
+                </td>
+                <td class="num">${esc(fmtBytes(sub.rx_bytes))}</td>
+                <td class="num">${esc(fmtBytes(sub.tx_bytes))}</td>
+                <td class="num">${sub.conn_count}</td>
+                <td class="num">${esc(fmtTime(sub.last_seen, false))}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderRecent(list) {
+      const tbody = document.getElementById('recentBody');
+      const filter = document.getElementById('domainFilter').value.trim().toLowerCase();
+      const rows = list.filter(r => {
+        if (!filter) return true;
+        return r.full_domain.toLowerCase().includes(filter) ||
+          r.root_domain.toLowerCase().includes(filter) ||
+          (r.service_label && r.service_label.toLowerCase().includes(filter));
+      });
+      if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无近期明细</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${esc(fmtTime(r.last_seen, false))}</td>
+          <td class="mono">
+            ${esc(r.full_domain)}
+            ${r.ech_ext ? '<span class="tag ech">含0xfe0d</span>' : ''}
+          </td>
+          <td class="mono">${esc(r.root_domain)}${r.service_label ? `<span class="tag">${esc(r.service_label)}</span>` : ''}</td>
+          <td class="num">${esc(fmtBytes(r.rx_bytes))}</td>
+          <td class="num">${esc(fmtBytes(r.tx_bytes))}</td>
+          <td class="num">${r.conn_count}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderStatus(st) {
+      const liveBadge = document.getElementById('liveBadge');
+      if (st.web_only) {
+        liveBadge.className = 'badge warn';
+        liveBadge.textContent = '仅网页预览模式';
+      } else if (st.running) {
+        liveBadge.className = st.socket_drops_total > 0 ? 'badge warn' : 'badge ok';
+        liveBadge.textContent = `采集中 · ${st.iface} (${st.local_ip})`;
+      } else {
+        liveBadge.className = 'badge warn';
+        liveBadge.textContent = '采集未运行';
+      }
+
+      const cfUser = document.getElementById('cfUserBadge');
+      if (st.cf_access_user) {
+        cfUser.style.display = 'inline-flex';
+        cfUser.textContent = `Access: ${st.cf_access_user}`;
+      }
+
+      document.getElementById('coverageNote').textContent = st.coverage_note || '';
+
+      const items = [
+        ['网卡 / 源地址', `${st.iface} / ${st.local_ip}`],
+        ['Socket 收包 / 丢包', `${st.socket_packets_total} / ${st.socket_drops_total}`],
+        ['已见 SYN 流 / 已识别 / 未识别', `${st.syn_flows_total} / ${st.resolved_flows_total} / ${st.unidentified_flows_total}`],
+        ['当前活跃流 / 待识别流', `${st.active_flows} / ${st.pending_flows} (${fmtBytes(st.pending_prefix_bytes)})`],
+        ['启动缺口 (包 / 字节)', `${st.preexisting_gap_packets} / ${fmtBytes(st.preexisting_gap_bytes)}`],
+        ['上限丢弃 (流表 / 前缀预算)', `${st.flow_limit_drops} / ${st.pending_budget_drops}`],
+        ['运行时长 / 最近落库', `${st.uptime_sec}s / ${fmtTime(st.last_flush_at, false)}`],
+        ['SQLite 占用 (含 WAL)', fmtBytes(st.db_size_bytes)]
+      ];
+
+      document.getElementById('statusGrid').innerHTML = items.map(([k, v]) => `
+        <div class="status-item">
+          <div class="status-k">${esc(k)}</div>
+          <div class="status-v">${esc(v)}</div>
+        </div>
+      `).join('');
+    }
+
+    document.querySelectorAll('[data-preset]').forEach(btn => {
+      btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
+    });
+
+    document.getElementById('applyCustomBtn').addEventListener('click', () => {
+      const f = parseBJLocalInput(document.getElementById('fromInput').value);
+      const t = parseBJLocalInput(document.getElementById('toInput').value);
+      if (f !== null && t !== null && f <= t) {
+        state.preset = 'custom';
+        state.from = f;
+        state.to = t;
+        state.drillFrom = null;
+        state.drillTo = null;
+        document.querySelectorAll('[data-preset]').forEach(el => el.classList.remove('active'));
+        loadAll();
+      }
+    });
+
+    document.getElementById('drillBadge').addEventListener('click', () => {
+      state.drillFrom = null;
+      state.drillTo = null;
+      loadAll();
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', loadAll);
+    document.getElementById('domainFilter').addEventListener('input', () => {
+      if (state.tab === 'domains') renderDomainsTable();
+      else loadAll();
+    });
+
+    document.getElementById('tabDomainsBtn').addEventListener('click', () => {
+      state.tab = 'domains';
+      document.getElementById('tabDomainsBtn').classList.add('active');
+      document.getElementById('tabRecentBtn').classList.remove('active');
+      document.getElementById('domainsPane').style.display = '';
+      document.getElementById('recentPane').style.display = 'none';
+      loadAll();
+    });
+
+    document.getElementById('tabRecentBtn').addEventListener('click', () => {
+      state.tab = 'recent';
+      document.getElementById('tabRecentBtn').classList.add('active');
+      document.getElementById('tabDomainsBtn').classList.remove('active');
+      document.getElementById('recentPane').style.display = '';
+      document.getElementById('domainsPane').style.display = 'none';
+      loadAll();
+    });
+
+    applyPreset('24h');
+    setInterval(loadAll, 30000);
+  </script>
+</body>
+</html>
