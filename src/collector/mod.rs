@@ -16,6 +16,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 
 pub const BUCKET_SECONDS: i64 = 300;
 const CLOSING_GRACE_SECS: u64 = 5;
@@ -171,6 +172,8 @@ struct FlowEntry {
     created_at: Instant,
     created_bucket_ts: i64,
     last_seen: Instant,
+    outbound_fin: bool,
+    inbound_fin: bool,
     closing_at: Option<Instant>,
     identity: FlowIdentity,
 }
@@ -225,13 +228,7 @@ impl FlowTracker {
     }
 
     /// Processes a single captured Ethernet frame.
-    pub fn handle_packet(
-        &mut self,
-        pkt: &[u8],
-        direction: Direction,
-        now: Instant,
-        unix_ts: i64,
-    ) {
+    pub fn handle_packet(&mut self, pkt: &[u8], direction: Direction, now: Instant, unix_ts: i64) {
         let Some(tcp) = parse_ethernet_ipv4_tcp(pkt) else {
             return;
         };
@@ -269,10 +266,8 @@ impl FlowTracker {
         self.parsed_packets_total += 1;
         let bucket_ts = align_bucket(unix_ts);
         let is_syn_only = (tcp.flags & TCP_SYN) != 0 && (tcp.flags & TCP_ACK) == 0;
-        let is_fin_or_rst = (tcp.flags & (TCP_FIN | TCP_RST)) != 0;
-
-        if direction == Direction::Outbound && is_syn_only {
-            self.handle_outbound_syn(key, tcp.seq, tcp.payload_len, now, bucket_ts);
+        let outbound_syn = direction == Direction::Outbound && is_syn_only;
+        if outbound_syn && !self.handle_outbound_syn(key, tcp.seq, now, bucket_ts) {
             return;
         }
 
@@ -284,8 +279,14 @@ impl FlowTracker {
         };
 
         flow.last_seen = now;
-        if is_fin_or_rst && flow.closing_at.is_none() {
-            flow.closing_at = Some(now);
+        if tcp.flags & TCP_FIN != 0 {
+            match direction {
+                Direction::Outbound => flow.outbound_fin = true,
+                Direction::Inbound => flow.inbound_fin = true,
+            }
+        }
+        if tcp.flags & TCP_RST != 0 || (flow.outbound_fin && flow.inbound_fin) {
+            flow.closing_at.get_or_insert(now);
         }
 
         let (tx_add, rx_add) = match direction {
@@ -307,7 +308,9 @@ impl FlowTracker {
 
                 if direction == Direction::Outbound && !tcp.captured_payload.is_empty() {
                     let prev_global = self.global_pending_bytes;
-                    match reasm.push(tcp.seq, tcp.captured_payload) {
+                    // A SYN consumes one sequence number before any TCP Fast Open data.
+                    let payload_seq = tcp.seq.wrapping_add(u32::from(outbound_syn));
+                    match reasm.push(payload_seq, tcp.captured_payload) {
                         Ok(delta_bytes) => {
                             let new_global = (prev_global as isize + delta_bytes).max(0) as usize;
                             self.global_pending_bytes = new_global;
@@ -317,7 +320,8 @@ impl FlowTracker {
                             } else {
                                 let decision = extract_domain_from_prefix(reasm.contiguous());
                                 match decision {
-                                    ParseDecision::Resolved { .. } | ParseDecision::Unrecognized => {
+                                    ParseDecision::Resolved { .. }
+                                    | ParseDecision::Unrecognized => {
                                         finalize_decision = Some(decision);
                                     }
                                     ParseDecision::NeedMoreData => {}
@@ -330,7 +334,7 @@ impl FlowTracker {
                     }
                 }
 
-                if finalize_decision.is_none() && is_fin_or_rst {
+                if finalize_decision.is_none() && flow.closing_at.is_some() {
                     finalize_decision = Some(ParseDecision::Unrecognized);
                 }
             }
@@ -375,15 +379,13 @@ impl FlowTracker {
         &mut self,
         key: FlowKey,
         syn_seq: u32,
-        payload_len: u64,
         now: Instant,
         bucket_ts: i64,
-    ) {
-        if let Some(existing) = self.flows.get_mut(&key) {
+    ) -> bool {
+        if let Some(existing) = self.flows.get(&key) {
             // Retransmitted SYN for an active flow with same ISN -> continue existing flow
             if existing.init_seq == syn_seq && existing.closing_at.is_none() {
-                existing.last_seen = now;
-                return;
+                return true;
             }
             // Otherwise a 5-tuple was reused: finalize & replace old entry immediately
             self.remove_flow(key);
@@ -391,7 +393,7 @@ impl FlowTracker {
 
         if self.flows.len() >= self.max_active_flows {
             self.flow_limit_drops += 1;
-            return;
+            return false;
         }
 
         self.syn_flows_total += 1;
@@ -405,20 +407,16 @@ impl FlowTracker {
                 bucket_ts,
                 UNIDENTIFIED_DOMAIN,
                 None,
-                payload_len,
+                0,
                 0,
                 1,
             );
             FlowIdentity::Unidentified
         } else {
             self.pending_flows_count += 1;
-            let mut pending_buckets = Vec::new();
-            if payload_len > 0 {
-                pending_buckets.push((bucket_ts, payload_len, 0));
-            }
             FlowIdentity::Pending {
                 reasm: PrefixReassembler::new(syn_seq, self.max_flow_prefix_bytes),
-                pending_buckets,
+                pending_buckets: Vec::new(),
             }
         };
 
@@ -429,10 +427,13 @@ impl FlowTracker {
                 created_at: now,
                 created_bucket_ts: bucket_ts,
                 last_seen: now,
+                outbound_fin: false,
+                inbound_fin: false,
                 closing_at: None,
                 identity,
             },
         );
+        true
     }
 
     fn finalize_pending_flow(&mut self, key: FlowKey, decision: ParseDecision, unix_ts: i64) {
@@ -458,7 +459,9 @@ impl FlowTracker {
         let created_bucket = flow.created_bucket_ts;
 
         match decision {
-            ParseDecision::Resolved { domain, ech_ext } => {
+            ParseDecision::Resolved { domain, ech_ext }
+                if !(ech_ext && domain == "cloudflare-ech.com") =>
+            {
                 let root_domain = extract_root_domain(&domain);
                 self.resolved_flows_total += 1;
                 Self::record_delta(
@@ -487,7 +490,9 @@ impl FlowTracker {
                     ech_ext,
                 };
             }
-            ParseDecision::Unrecognized | ParseDecision::NeedMoreData => {
+            ParseDecision::Resolved { .. }
+            | ParseDecision::Unrecognized
+            | ParseDecision::NeedMoreData => {
                 self.unidentified_flows_total += 1;
                 Self::record_delta(
                     &mut self.flush_batch,
@@ -667,12 +672,21 @@ pub fn start_capture_thread(
     tx_flush: std::sync::mpsc::SyncSender<FlushBatch>,
     status: Arc<RwLock<CollectorStatus>>,
     shutdown: Arc<AtomicBool>,
+    worker_failure: Arc<Notify>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let fd = linux_capture::open_capture_socket(&cfg.iface, local_ip, cfg.rcvbuf_bytes)?;
     Ok(std::thread::Builder::new()
         .name("af-packet-capture".to_string())
         .spawn(move || {
-            linux_capture::run_capture_loop(fd, cfg, local_ip, tx_flush, status, shutdown);
+            linux_capture::run_capture_loop(
+                fd,
+                cfg,
+                local_ip,
+                tx_flush,
+                status,
+                shutdown,
+                worker_failure,
+            );
         })?)
 }
 
@@ -683,6 +697,7 @@ pub fn start_capture_thread(
     _tx_flush: std::sync::mpsc::SyncSender<FlushBatch>,
     _status: Arc<RwLock<CollectorStatus>>,
     _shutdown: Arc<AtomicBool>,
+    _worker_failure: Arc<Notify>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -782,7 +797,16 @@ mod tests {
         assert_eq!(tracker.resolved_flows_total, 1);
 
         // 4. Inbound truncated 160B packet reporting full 2040B IP packet (2000B TCP payload)
-        let mut rx = make_tcp_pkt(remote, local, 80, 50001, 5000, TCP_ACK, Some(2040), &[0u8; 106]);
+        let mut rx = make_tcp_pkt(
+            remote,
+            local,
+            80,
+            50001,
+            5000,
+            TCP_ACK,
+            Some(2040),
+            &[0u8; 106],
+        );
         rx.truncate(160);
         tracker.handle_packet(&rx, Direction::Inbound, t0, unix0);
 
@@ -791,7 +815,12 @@ mod tests {
         tracker.handle_packet(&fin, Direction::Outbound, t0, unix0);
 
         let syn2 = make_tcp_pkt(local, remote, 50001, 80, 9000, TCP_SYN, None, &[]);
-        tracker.handle_packet(&syn2, Direction::Outbound, t0 + Duration::from_secs(1), unix0 + 1);
+        tracker.handle_packet(
+            &syn2,
+            Direction::Outbound,
+            t0 + Duration::from_secs(1),
+            unix0 + 1,
+        );
         assert_eq!(tracker.pending_flows(), 1);
 
         // Expire pending timeout (3s) -> falls back to 未识别
@@ -800,7 +829,10 @@ mod tests {
 
         let batch = tracker.take_flush_batch();
         let bts = align_bucket(unix0);
-        let ex = batch.buckets.get(&(bts, "example.com".to_string())).unwrap();
+        let ex = batch
+            .buckets
+            .get(&(bts, "example.com".to_string()))
+            .unwrap();
         assert_eq!(ex.tx_bytes, (part1.len() + part2.len()) as u64);
         assert_eq!(ex.rx_bytes, 2000);
         assert_eq!(ex.conn_count, 1);
@@ -810,6 +842,49 @@ mod tests {
             .get(&(bts, UNIDENTIFIED_DOMAIN.to_string()))
             .unwrap();
         assert_eq!(unid.conn_count, 1);
+    }
+
+    #[test]
+    fn tracks_fast_open_payload_and_download_after_local_fin() {
+        let local = Ipv4Addr::new(10, 0, 0, 2);
+        let remote = Ipv4Addr::new(192, 0, 2, 10);
+        let mut tracker = FlowTracker::new(local, &test_cfg());
+        let now = Instant::now();
+        let ts = 1_795_000_200;
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let syn = make_tcp_pkt(local, remote, 50000, 80, 100, TCP_SYN, None, request);
+        tracker.handle_packet(&syn, Direction::Outbound, now, ts);
+        tracker.handle_packet(&syn, Direction::Outbound, now, ts);
+        assert_eq!(tracker.syn_flows_total, 1);
+        assert_eq!(tracker.resolved_flows_total, 1);
+
+        let fin = make_tcp_pkt(
+            local,
+            remote,
+            50000,
+            80,
+            101 + request.len() as u32,
+            TCP_FIN | TCP_ACK,
+            None,
+            &[],
+        );
+        tracker.handle_packet(&fin, Direction::Outbound, now, ts);
+        let later = now + Duration::from_secs(CLOSING_GRACE_SECS + 1);
+        tracker.expire(later, ts + 6);
+        let reply = make_tcp_pkt(remote, local, 80, 50000, 200, TCP_ACK, None, b"reply");
+        tracker.handle_packet(&reply, Direction::Inbound, later, ts + 6);
+        assert_eq!(tracker.preexisting_gap_bytes, 0);
+
+        let reply_fin = make_tcp_pkt(remote, local, 80, 50000, 205, TCP_FIN | TCP_ACK, None, &[]);
+        tracker.handle_packet(&reply_fin, Direction::Inbound, later, ts + 6);
+        tracker.expire(later + Duration::from_secs(CLOSING_GRACE_SECS), ts + 11);
+        assert_eq!(tracker.active_flows(), 0);
+
+        let batch = tracker.take_flush_batch();
+        let row = &batch.buckets[&(align_bucket(ts), "example.com".into())];
+        assert_eq!(row.tx_bytes, (request.len() * 2) as u64);
+        assert_eq!(row.rx_bytes, 5);
+        assert_eq!(row.conn_count, 1);
     }
 
     #[test]

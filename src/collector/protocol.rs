@@ -43,7 +43,7 @@ pub fn parse_ethernet_ipv4_tcp(pkt: &[u8]) -> Option<ParsedTcpPacket<'_>> {
 
     let tot_len = u16::from_be_bytes([ip[2], ip[3]]) as usize;
     let frag_off = u16::from_be_bytes([ip[6], ip[7]]);
-    if (frag_off & 0x1fff) != 0 {
+    if (frag_off & 0x3fff) != 0 {
         return None;
     }
     if ip[9] != 6 {
@@ -140,7 +140,7 @@ impl PrefixReassembler {
         let rel = seq.wrapping_sub(self.base_seq) as i32;
 
         let (start, slice) = if rel < 0 {
-            let skip = (-rel) as usize;
+            let skip = rel.unsigned_abs() as usize;
             if skip >= data.len() {
                 return Ok(0);
             }
@@ -231,29 +231,7 @@ fn parse_tls_client_hello(buf: &[u8]) -> ParseDecision {
 
         let rec_start = pos + 5;
         let rec_end = rec_start + rec_len;
-        if buf.len() < rec_end {
-            // Even if incomplete, if we already buffered enough ClientHello bytes from prior records
-            // plus partial bytes here, append partial slice to check if we have full handshake_len.
-            handshake.extend_from_slice(&buf[rec_start..]);
-            if let Some(need) = expected_hs_len {
-                if handshake.len() >= need {
-                    break;
-                }
-            } else if handshake.len() >= 4 {
-                if handshake[0] != 0x01 {
-                    return ParseDecision::Unrecognized;
-                }
-                let hs_len = ((handshake[1] as usize) << 16)
-                    | ((handshake[2] as usize) << 8)
-                    | (handshake[3] as usize);
-                if handshake.len() >= 4 + hs_len {
-                    break;
-                }
-            }
-            return ParseDecision::NeedMoreData;
-        }
-
-        handshake.extend_from_slice(&buf[rec_start..rec_end]);
+        handshake.extend_from_slice(&buf[rec_start..rec_end.min(buf.len())]);
         pos = rec_end;
 
         if expected_hs_len.is_none() && handshake.len() >= 4 {
@@ -266,10 +244,11 @@ fn parse_tls_client_hello(buf: &[u8]) -> ParseDecision {
             expected_hs_len = Some(4 + hs_len);
         }
 
-        if let Some(need) = expected_hs_len {
-            if handshake.len() >= need {
-                break;
-            }
+        if expected_hs_len.is_some_and(|need| handshake.len() >= need) {
+            break;
+        }
+        if rec_end > buf.len() {
+            return ParseDecision::NeedMoreData;
         }
     }
 
@@ -403,41 +382,36 @@ fn parse_http_host(buf: &[u8]) -> ParseDecision {
         return ParseDecision::Unrecognized;
     }
 
-    if buf.len() < 8 && HTTP_METHODS.iter().any(|m| buf.len() < m.len() && m.starts_with(buf)) {
+    if buf.len() < 8
+        && HTTP_METHODS
+            .iter()
+            .any(|m| buf.len() < m.len() && m.starts_with(buf))
+    {
         return ParseDecision::NeedMoreData;
     }
 
-    // Parse complete lines looking for `Host:`
-    let Ok(text) = std::str::from_utf8(buf) else {
-        // Wait only if truncated inside UTF-8 at tail? HTTP headers are ASCII.
-        return ParseDecision::Unrecognized;
-    };
-
-    let mut pos = 0usize;
-    let bytes = text.as_bytes();
-    while pos < bytes.len() {
-        let Some(rel_nl) = bytes[pos..].iter().position(|&b| b == b'\n') else {
+    // Stop within the headers so a binary HTTP body cannot invalidate an otherwise readable Host.
+    for raw_line in buf.split_inclusive(|&b| b == b'\n').skip(1) {
+        let Some(line) = raw_line.strip_suffix(b"\n") else {
             return ParseDecision::NeedMoreData;
         };
-        let line_raw = &text[pos..pos + rel_nl];
-        let line = line_raw.trim_end_matches('\r');
-        pos += rel_nl + 1;
-
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
-            // End of HTTP headers without Host
             return ParseDecision::Unrecognized;
         }
-
-        if let Some((name, val)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("host") {
-                return match normalize_hostname(val) {
-                    Some(domain) => ParseDecision::Resolved {
-                        domain,
-                        ech_ext: false,
-                    },
-                    None => ParseDecision::Unrecognized,
-                };
-            }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && line[..colon].eq_ignore_ascii_case(b"host")
+        {
+            return match std::str::from_utf8(&line[colon + 1..])
+                .ok()
+                .and_then(normalize_hostname)
+            {
+                Some(domain) => ParseDecision::Resolved {
+                    domain,
+                    ech_ext: false,
+                },
+                None => ParseDecision::Unrecognized,
+            };
         }
     }
 
@@ -515,6 +489,14 @@ mod tests {
             ParseDecision::NeedMoreData
         );
 
+        let mut partial_record = single_rec.clone();
+        let declared_record_len = (hs.len() + 20) as u16;
+        partial_record[3..5].copy_from_slice(&declared_record_len.to_be_bytes());
+        assert_eq!(
+            extract_domain_from_prefix(&partial_record),
+            extract_domain_from_prefix(&single_rec)
+        );
+
         // Split ClientHello across two TLS records
         let mid = hs.len() / 2;
         let mut multi_rec = wrap_tls_record(&hs[..mid]);
@@ -572,6 +554,12 @@ mod tests {
                 domain: "example.org".into(),
                 ech_ext: false
             }
+        );
+        let mut with_binary_body = req.to_vec();
+        with_binary_body.extend_from_slice(b"\xff\xfe\x00");
+        assert_eq!(
+            extract_domain_from_prefix(&with_binary_body),
+            extract_domain_from_prefix(req)
         );
         assert_eq!(
             extract_domain_from_prefix(b"\x17\x03\x03\x00\x10hello"),

@@ -1,10 +1,11 @@
 use crate::collector::domain::{UNIDENTIFIED_DOMAIN, service_label};
-use crate::collector::{FlushBatch, unix_now};
+use crate::collector::{CollectorStatus, FlushBatch, align_bucket, unix_now};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use std::path::Path;
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, RwLock, mpsc::Receiver};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OverviewSummary {
@@ -141,28 +142,26 @@ pub fn start_writer_thread(
     rx: Receiver<FlushBatch>,
     recent_retention_hours: i64,
     bucket_retention_days: i64,
+    status: Arc<RwLock<CollectorStatus>>,
+    worker_failure: Arc<Notify>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let mut conn = open_rw(&db_path).map_err(std::io::Error::other)?;
+    configure_connection(&conn).map_err(std::io::Error::other)?;
     std::thread::Builder::new()
         .name("sqlite-writer".to_string())
         .spawn(move || {
-            let mut conn = match open_rw(&db_path).and_then(|c| {
-                configure_connection(&c)?;
-                Ok(c)
-            }) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to open SQLite writer connection");
-                    return;
-                }
-            };
-
             let mut last_cleanup = Instant::now();
             let cleanup_interval = Duration::from_secs(3600);
 
             while let Ok(batch) = rx.recv() {
                 if !batch.is_empty() {
                     if let Err(e) = write_batch(&mut conn, &batch) {
-                        tracing::error!(error = %e, "failed to flush SQLite batch");
+                        tracing::error!(error = %e, "failed to flush SQLite batch; restarting service");
+                        worker_failure.notify_one();
+                        return;
+                    }
+                    if let Ok(mut guard) = status.write() {
+                        guard.last_flush_at = Some(unix_now());
                     }
                 }
                 if last_cleanup.elapsed() >= cleanup_interval {
@@ -263,11 +262,14 @@ pub fn query_overview(
     to_ts: i64,
     step_secs: i64,
 ) -> rusqlite::Result<OverviewResponse> {
-    let conn = open_ro(db_path)?;
+    let mut conn = open_ro(db_path)?;
+    let snapshot = conn.transaction()?;
     let step = step_secs.max(300);
+    let from_bucket = align_bucket(from_ts);
+    let to_bucket = align_bucket(to_ts);
 
-    // 1. Domain ranking across [from_ts, to_ts]
-    let mut stmt_dom = conn.prepare(
+    // Use the same snapshot and whole buckets for the ranking and timeline.
+    let mut stmt_dom = snapshot.prepare(
         r#"
         SELECT
             root_domain,
@@ -288,7 +290,7 @@ pub fn query_overview(
     let mut unid_tx: u64 = 0;
     let mut unid_rx: u64 = 0;
 
-    let rows = stmt_dom.query_map(params![from_ts, to_ts], |row| {
+    let rows = stmt_dom.query_map(params![from_bucket, to_bucket], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?.max(0) as u64,
@@ -310,7 +312,8 @@ pub fn query_overview(
     }
 
     let grand_total = (total_tx + total_rx).max(1) as f64;
-    let active_root_domains = raw_domains.len();
+    let active_root_domains =
+        raw_domains.len() - usize::from(raw_domains.iter().any(|row| row.0 == UNIDENTIFIED_DOMAIN));
 
     let domains: Vec<DomainRankRow> = raw_domains
         .into_iter()
@@ -336,7 +339,7 @@ pub fn query_overview(
         .collect();
 
     // 2. Time-series rollup
-    let mut stmt_tl = conn.prepare(
+    let mut stmt_tl = snapshot.prepare(
         r#"
         SELECT
             (bucket_ts / ?3) * ?3 AS slot_ts,
@@ -352,7 +355,7 @@ pub fn query_overview(
     )?;
 
     let tl_rows = stmt_tl.query_map(
-        params![from_ts, to_ts, step, UNIDENTIFIED_DOMAIN],
+        params![from_bucket, to_bucket, step, UNIDENTIFIED_DOMAIN],
         |row| {
             Ok(TimelinePoint {
                 ts: row.get(0)?,
@@ -417,19 +420,22 @@ pub fn query_domain_details(
         "#,
     )?;
 
-    let rows = stmt.query_map(params![root_domain, from_ts, to_ts], |row| {
-        let tx = row.get::<_, i64>(2)?.max(0) as u64;
-        let rx = row.get::<_, i64>(3)?.max(0) as u64;
-        Ok(SubdomainDetailRow {
-            full_domain: row.get(0)?,
-            ech_ext: row.get::<_, i64>(1)? > 0,
-            tx_bytes: tx,
-            rx_bytes: rx,
-            total_bytes: tx + rx,
-            conn_count: row.get::<_, i64>(4)?.max(0) as u64,
-            last_seen: row.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![root_domain, align_bucket(from_ts), align_bucket(to_ts)],
+        |row| {
+            let tx = row.get::<_, i64>(2)?.max(0) as u64;
+            let rx = row.get::<_, i64>(3)?.max(0) as u64;
+            Ok(SubdomainDetailRow {
+                full_domain: row.get(0)?,
+                ech_ext: row.get::<_, i64>(1)? > 0,
+                tx_bytes: tx,
+                rx_bytes: rx,
+                total_bytes: tx + rx,
+                conn_count: row.get::<_, i64>(4)?.max(0) as u64,
+                last_seen: row.get(5)?,
+            })
+        },
+    )?;
 
     let mut out = Vec::new();
     for item in rows {
@@ -550,6 +556,17 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert_eq!(details[0].full_domain, "www.youtube.com");
         assert!(details[0].ech_ext);
+
+        let inside_bucket = query_overview(&db_path, bts + 1, bts + 2, 300).unwrap();
+        assert_eq!(inside_bucket.summary.total_rx_bytes, 52_500);
+        assert_eq!(inside_bucket.summary.active_root_domains, 1);
+        assert_eq!(inside_bucket.timeline[0].rx_bytes, 52_500);
+        assert_eq!(
+            query_domain_details(&db_path, "youtube.com", bts + 1, bts + 2)
+                .unwrap()
+                .len(),
+            1
+        );
 
         let recent = query_recent(&db_path, 10).unwrap();
         assert_eq!(recent.len(), 1);

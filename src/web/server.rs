@@ -1,7 +1,5 @@
-use crate::collector::{CollectorStatus, unix_now};
-use crate::storage::sqlite::{
-    db_size_bytes, query_domain_details, query_overview, query_recent,
-};
+use crate::collector::{BUCKET_SECONDS, CollectorStatus, unix_now};
+use crate::storage::sqlite::{db_size_bytes, query_domain_details, query_overview, query_recent};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -50,22 +48,31 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/domain/{root}/details", get(api_domain_details))
         .route("/api/recent", get(api_recent))
         .route("/api/status", get(api_status))
+        .layer(axum::middleware::map_response(
+            |mut response: Response| async {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-store"),
+                );
+                response
+            },
+        ))
         .with_state(state)
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state.status.read().is_ok_and(|s| s.running || s.web_only) {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "collector unavailable")
+    }
 }
 
 async fn serve_index() -> Response {
     match StaticAssets::get("index.html") {
         Some(file) => {
             let body = String::from_utf8_lossy(&file.data).into_owned();
-            (
-                [(header::CACHE_CONTROL, "no-store")],
-                Html(body),
-            )
-                .into_response()
+            Html(body).into_response()
         }
         None => (StatusCode::NOT_FOUND, "index.html not embedded").into_response(),
     }
@@ -73,11 +80,15 @@ async fn serve_index() -> Response {
 
 fn normalize_range(q: &RangeQuery) -> (i64, i64, i64) {
     let now = unix_now();
-    let to = q.to.unwrap_or(now);
-    let from = q.from.unwrap_or(to - 24 * 3600).min(to);
-    let span = (to - from).max(300);
-    let default_step = if span > 36 * 3600 { 3600 } else { 300 };
-    let step = q.step.unwrap_or(default_step).max(300);
+    let to = q.to.unwrap_or(now).clamp(0, now);
+    let from = q.from.unwrap_or(to - 24 * 3600).clamp(0, to);
+    let default_step = if to - from > 36 * 3600 {
+        3600
+    } else {
+        BUCKET_SECONDS
+    };
+    let step = q.step.unwrap_or(default_step).clamp(BUCKET_SECONDS, 86_400);
+    let step = step - step % BUCKET_SECONDS;
     (from, to, step)
 }
 
@@ -121,10 +132,7 @@ async fn api_recent(
     Ok(Json(res))
 }
 
-async fn api_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<StatusResponse> {
+async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {
     let collector = state
         .status
         .read()

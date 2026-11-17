@@ -59,7 +59,7 @@ pub fn build_ipv4_tcp_80_443_filter(local_ip: Ipv4Addr) -> Vec<SockFilter> {
     //  2: ldb  [23]              ; IPv4 protocol
     //  3: jeq  #6, +0, L_DROP(21)
     //  4: ldh  [20]              ; IPv4 flags + frag_off
-    //  5: jset #0x1fff, L_DROP(21), +0
+    //  5: jset #0x3fff, L_DROP(21), +0
     //  6: ldx  4*([14]&0xf)      ; X = IPv4 IHL bytes
     //  7: txa                    ; A = X
     //  8: jge  #20, +0, L_DROP(21)
@@ -92,9 +92,9 @@ pub fn build_ipv4_tcp_80_443_filter(local_ip: Ipv4Addr) -> Vec<SockFilter> {
         // 2..3: IP proto == TCP (6)
         bpf_stmt(BPF_LD | BPF_B | BPF_ABS, 23),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 6, 0, 19), // jf -> 23 (3 + 1 + 19 = 23)
-        // 4..5: Not a subsequent IP fragment (frag_off & 0x1fff == 0)
+        // 4..5: Reject subsequent and first IP fragments (MF flag or nonzero offset)
         bpf_stmt(BPF_LD | BPF_H | BPF_ABS, 20),
-        bpf_jump(BPF_JMP | BPF_JSET | BPF_K, 0x1fff, 17, 0), // jt -> 23 (5 + 1 + 17 = 23)
+        bpf_jump(BPF_JMP | BPF_JSET | BPF_K, 0x3fff, 17, 0), // jt -> 23 (5 + 1 + 17 = 23)
         // 6..8: X = IHL >= 20
         bpf_stmt(BPF_LDX | BPF_MSH | BPF_B, 14),
         bpf_stmt(BPF_MISC | BPF_TXA, 0),
@@ -296,6 +296,9 @@ mod tests {
         // Subsequent IP fragment -> DROP
         let frag = make_eth_ipv4_tcp(local, remote, 54324, 443, 5, 0x0040, 6, 0x0800);
         assert_eq!(eval_cbpf(&prog, &frag), 0);
+
+        let first_fragment = make_eth_ipv4_tcp(local, remote, 54324, 443, 5, 0x2000, 6, 0x0800);
+        assert_eq!(eval_cbpf(&prog, &first_fragment), 0);
 
         // Malformed IHL < 5 -> DROP
         let bad_ihl = make_eth_ipv4_tcp(local, remote, 54324, 443, 4, 0, 6, 0x0800);

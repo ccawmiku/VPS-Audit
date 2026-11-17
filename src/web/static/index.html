@@ -302,10 +302,12 @@
       tab: 'domains'
     };
 
-    function applyPreset(preset) {
-      state.preset = preset;
-      state.drillFrom = null;
-      state.drillTo = null;
+    function updatePresetRange(preset, resetInputs = false) {
+      const fromInput = document.getElementById('fromInput');
+      const toInput = document.getElementById('toInput');
+      const followPreset = resetInputs || (
+        fromInput.value === toBJLocalInput(state.from) && toInput.value === toBJLocalInput(state.to)
+      );
       const now = Math.floor(Date.now() / 1000);
       let from = now - 86400;
       if (preset === '1h') from = now - 3600;
@@ -318,15 +320,30 @@
       }
       state.from = from;
       state.to = now;
-      document.getElementById('fromInput').value = toBJLocalInput(from);
-      document.getElementById('toInput').value = toBJLocalInput(now);
+      if (followPreset) {
+        fromInput.value = toBJLocalInput(from);
+        toInput.value = toBJLocalInput(now);
+      }
+    }
+
+    function applyPreset(preset) {
+      state.preset = preset;
+      state.drillFrom = null;
+      state.drillTo = null;
+      updatePresetRange(preset, true);
       document.querySelectorAll('[data-preset]').forEach(el => {
         el.classList.toggle('active', el.dataset.preset === preset);
       });
       loadAll();
     }
 
+    let latestRequest = 0;
+
     async function loadAll() {
+      const request = ++latestRequest;
+      if (state.preset !== 'custom' && state.drillFrom === null) {
+        updatePresetRange(state.preset);
+      }
       const qFrom = state.drillFrom ?? state.from;
       const qTo = state.drillTo ?? state.to;
       const drillBadge = document.getElementById('drillBadge');
@@ -337,23 +354,31 @@
         drillBadge.style.display = 'none';
       }
 
-      const [ovRes, stRes, recRes] = await Promise.all([
-        fetch(`/api/overview?from=${qFrom}&to=${qTo}`),
-        fetch('/api/status'),
-        state.tab === 'recent' ? fetch('/api/recent?limit=150') : Promise.resolve(null)
-      ]);
+      try {
+        const [ov, status, recent] = await Promise.all([
+          fetchJson(`/api/overview?from=${qFrom}&to=${qTo}`),
+          fetchJson('/api/status'),
+          state.tab === 'recent' ? fetchJson('/api/recent?limit=150') : null
+        ]);
+        if (request !== latestRequest) return;
 
-      const ov = await ovRes.json();
-      state.overview = ov;
-      renderOverview(ov);
-
-      const st = await stRes.json();
-      renderStatus(st);
-
-      if (recRes) {
-        const rec = await recRes.json();
-        renderRecent(rec);
+        state.overview = ov;
+        renderOverview(ov);
+        renderStatus(status);
+        if (recent) renderRecent(recent);
+      } catch (error) {
+        if (request !== latestRequest) return;
+        const badge = document.getElementById('liveBadge');
+        badge.className = 'badge warn';
+        badge.textContent = '加载失败，请刷新页面';
+        console.error(error);
       }
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+      return response.json();
     }
 
     function renderOverview(ov) {
@@ -369,11 +394,11 @@
       document.getElementById('sumWindow').textContent = `${fmtTime(s.from_ts, true)} ~ ${fmtTime(s.to_ts, true)}`;
       document.getElementById('stepLabel').textContent = `粒度: ${Math.round(s.step_secs / 60)} 分钟`;
 
-      renderChart(ov.timeline, s.step_secs);
+      renderChart(ov.timeline, s);
       renderDomainsTable();
     }
 
-    function renderChart(points, stepSecs) {
+    function renderChart(points, summary) {
       const svg = document.getElementById('timelineSvg');
       const tip = document.getElementById('tooltip');
       if (!points || points.length === 0) {
@@ -385,8 +410,11 @@
       const plotW = W - padL - padR;
       const plotH = H - padT - padB;
       const maxVal = Math.max(1, ...points.map(p => p.rx_bytes + p.tx_bytes));
-      const barStep = plotW / points.length;
-      const barW = Math.max(2, Math.min(28, barStep * 0.72));
+      const stepSecs = summary.step_secs;
+      const firstSlot = Math.floor(summary.from_ts / stepSecs) * stepSecs;
+      const slotCount = Math.floor((summary.to_ts - firstSlot) / stepSecs) + 1;
+      const barStep = plotW / slotCount;
+      const barW = Math.min(28, barStep * 0.72);
 
       let html = '';
       // Grid lines (0%, 50%, 100%)
@@ -401,7 +429,7 @@
         const totalH = (total / maxVal) * plotH;
         const rxH = (p.rx_bytes / maxVal) * plotH;
         const txH = Math.max(0, totalH - rxH);
-        const x = padL + idx * barStep + (barStep - barW) / 2;
+        const x = padL + (p.ts - firstSlot) / stepSecs * barStep + (barStep - barW) / 2;
         const yRx = padT + plotH - rxH;
         const yTx = yRx - txH;
 
@@ -413,12 +441,11 @@
       });
 
       // X-axis labels (up to 6 evenly spaced)
-      const labelCount = Math.min(6, points.length);
+      const labelCount = Math.min(6, slotCount);
       for (let i = 0; i < labelCount; i++) {
-        const idx = labelCount === 1 ? 0 : Math.round((i * (points.length - 1)) / (labelCount - 1));
-        const p = points[idx];
-        const x = padL + idx * barStep + barStep / 2;
-        html += `<text x="${x}" y="${H - 8}" text-anchor="middle" fill="#64748b" font-size="10">${esc(fmtTime(p.ts, true))}</text>`;
+        const slot = labelCount === 1 ? 0 : Math.round(i * (slotCount - 1) / (labelCount - 1));
+        const x = padL + slot * barStep + barStep / 2;
+        html += `<text x="${x}" y="${H - 8}" text-anchor="middle" fill="#64748b" font-size="10">${esc(fmtTime(firstSlot + slot * stepSecs, true))}</text>`;
       }
 
       svg.innerHTML = html;
@@ -439,8 +466,8 @@
         });
         g.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
         g.addEventListener('click', () => {
-          state.drillFrom = p.ts;
-          state.drillTo = p.ts + stepSecs - 1;
+          state.drillFrom = Math.max(summary.from_ts, p.ts);
+          state.drillTo = Math.min(summary.to_ts, p.ts + stepSecs - 1);
           loadAll();
         });
       });
@@ -483,7 +510,7 @@
       }).join('');
 
       tbody.querySelectorAll('.rank-row').forEach(tr => {
-        tr.addEventListener('click', async () => {
+        tr.addEventListener('click', () => {
           const root = tr.dataset.root;
           if (state.expandedRoot === root) {
             state.expandedRoot = null;
@@ -492,7 +519,6 @@
           }
           state.expandedRoot = root;
           renderDomainsTable();
-          await loadDomainDetails(root);
         });
       });
 
@@ -506,8 +532,14 @@
       const qTo = state.drillTo ?? state.to;
       const row = document.getElementById(`detail-${root}`);
       if (!row) return;
-      const res = await fetch(`/api/domain/${encodeURIComponent(root)}/details?from=${qFrom}&to=${qTo}`);
-      const details = await res.json();
+      let details;
+      try {
+        details = await fetchJson(`/api/domain/${encodeURIComponent(root)}/details?from=${qFrom}&to=${qTo}`);
+      } catch (error) {
+        row.firstElementChild.textContent = '明细加载失败';
+        console.error(error);
+        return;
+      }
       if (!details || details.length === 0) {
         row.firstElementChild.innerHTML = '<span style="color:var(--muted)">暂无近期完整子域名明细（可能已超过保留期或为「未识别」流）</span>';
         return;

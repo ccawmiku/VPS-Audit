@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 #[repr(C)]
 #[derive(Default)]
@@ -65,12 +66,15 @@ pub fn open_capture_socket(
     if ifindex == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("interface {iface} not found: {}", std::io::Error::last_os_error()),
+            format!(
+                "interface {iface} not found: {}",
+                std::io::Error::last_os_error()
+            ),
         ));
     }
 
-    let proto = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
-    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
+    // A zero protocol leaves packet delivery disabled until bind specifies the interface and protocol.
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -144,6 +148,7 @@ pub fn run_capture_loop(
     tx_flush: SyncSender<FlushBatch>,
     status: Arc<RwLock<CollectorStatus>>,
     shutdown: Arc<AtomicBool>,
+    worker_failure: Arc<Notify>,
 ) {
     let mut tracker = FlowTracker::new(local_ip, &cfg);
     let mut buf = vec![0u8; 20_480];
@@ -161,7 +166,8 @@ pub fn run_capture_loop(
         revents: 0,
     };
 
-    while !shutdown.load(Ordering::Relaxed) {
+    let mut failed = false;
+    'capture: while !shutdown.load(Ordering::Relaxed) {
         let pret = unsafe { libc::poll(&mut pfd, 1, 500) };
         if pret < 0 {
             let err = std::io::Error::last_os_error();
@@ -169,6 +175,12 @@ pub fn run_capture_loop(
                 continue;
             }
             tracing::error!(error = %err, "AF_PACKET poll error");
+            failed = true;
+            break;
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            tracing::error!(events = pfd.revents, "AF_PACKET socket failed");
+            failed = true;
             break;
         }
 
@@ -195,7 +207,8 @@ pub fn run_capture_loop(
                         break;
                     }
                     tracing::error!(error = %err, "AF_PACKET recvfrom error");
-                    break;
+                    failed = true;
+                    break 'capture;
                 }
                 if n == 0 {
                     break;
@@ -245,21 +258,26 @@ pub fn run_capture_loop(
             if !pending_carry.is_empty() {
                 let to_send = std::mem::take(&mut pending_carry);
                 match tx_flush.try_send(to_send) {
-                    Ok(()) => {
-                        if let Ok(mut guard) = status.write() {
-                            guard.last_flush_at = Some(unix_now());
-                        }
-                    }
+                    Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                         pending_carry.merge_from(returned);
                         tracing::warn!("SQLite flush channel full; carrying batch in memory");
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        tracing::error!("SQLite writer disconnected");
+                        failed = true;
                         break;
                     }
                 }
             }
         }
+    }
+
+    if let Ok(mut guard) = status.write() {
+        guard.running = false;
+    }
+    if failed {
+        worker_failure.notify_one();
     }
 
     // Final flush on shutdown: expire pending flows immediately so buffered bytes are not lost
