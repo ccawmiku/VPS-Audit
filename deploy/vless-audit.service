@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=vless-audit
 Group=vless-audit
-ExecStart=/usr/local/bin/vless-audit --iface eth0 --listen 127.0.0.1:18080 --db-path /var/lib/vless-audit/audit.db
+EnvironmentFile=-/etc/vless-audit.env
+ExecStart=/usr/local/bin/vless-audit
 Restart=on-failure
 RestartSec=3
 

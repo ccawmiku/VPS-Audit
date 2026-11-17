@@ -99,6 +99,7 @@ impl FlushBatch {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectorStatus {
+    pub instance_name: Option<String>,
     pub running: bool,
     pub web_only: bool,
     pub iface: String,
@@ -125,6 +126,7 @@ pub struct CollectorStatus {
 impl CollectorStatus {
     pub fn new(cfg: &AppConfig, local_ip: Option<Ipv4Addr>, started_at: i64) -> Self {
         Self {
+            instance_name: cfg.instance_name.clone(),
             running: !cfg.web_only,
             web_only: cfg.web_only,
             iface: cfg.iface.clone(),
@@ -741,6 +743,7 @@ mod tests {
 
     fn test_cfg() -> AppConfig {
         AppConfig {
+            instance_name: None,
             iface: "eth0".into(),
             local_ip: Some(Ipv4Addr::new(10, 1, 1, 4)),
             db_path: ":memory:".into(),

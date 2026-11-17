@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>VLESS 旁路流量审计 · Azure 东京 A1</title>
+  <title>VLESS 旁路流量审计</title>
   <style>
     :root {
       --bg: #0b1120;
@@ -130,7 +130,7 @@
   <div class="wrap">
     <header>
       <div>
-        <h1>VLESS 旁路流量审计 <span class="badge">出站 TCP 80/443 负载估算</span></h1>
+        <h1><span id="auditTitle">VLESS 旁路流量审计</span> <span class="badge">出站 TCP 80/443 负载估算</span></h1>
         <div class="subtitle">
           仅统计本机主动出站 TCP 80/443 负载（不含 QUIC/UDP、非 80/443 端口及 IPv6），数值与云厂商配额口径略有差异；展示时间为北京时间 (UTC+8)。
         </div>
@@ -602,6 +602,10 @@
     }
 
     function renderStatus(st) {
+      const title = st.instance_name ? `VLESS 旁路流量审计 · ${st.instance_name}` : 'VLESS 旁路流量审计';
+      document.title = title;
+      document.getElementById('auditTitle').textContent = title;
+
       const liveBadge = document.getElementById('liveBadge');
       if (st.web_only) {
         liveBadge.className = 'badge warn';

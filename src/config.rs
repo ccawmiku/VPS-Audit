@@ -6,6 +6,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "vless-audit", version, about = "Passive AF_PACKET TCP 80/443 traffic & domain auditor")]
 pub struct AppConfig {
+    /// Optional name shown in the audit dashboard.
+    #[arg(long, env = "VLESS_AUDIT_INSTANCE_NAME")]
+    pub instance_name: Option<String>,
+
     /// Network interface to capture on (e.g. eth0).
     #[arg(long, env = "VLESS_AUDIT_IFACE", default_value = "eth0")]
     pub iface: String,

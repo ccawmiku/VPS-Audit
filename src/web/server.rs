@@ -138,6 +138,7 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<S
         .read()
         .map(|s| s.clone())
         .unwrap_or_else(|_| CollectorStatus {
+            instance_name: None,
             running: false,
             web_only: true,
             iface: String::new(),
