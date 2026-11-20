@@ -1,4 +1,4 @@
-use crate::collector::cbpf::{attach_filter, build_ipv4_tcp_80_443_filter};
+use crate::collector::cbpf::{attach_filter, build_ipv4_tcp_filter};
 use crate::collector::{CollectorStatus, Direction, FlowTracker, FlushBatch, unix_now};
 use crate::config::AppConfig;
 use std::ffi::CString;
@@ -55,11 +55,8 @@ pub fn detect_iface_ipv4(iface: &str) -> std::io::Result<Ipv4Addr> {
     })
 }
 
-pub fn open_capture_socket(
-    iface: &str,
-    local_ip: Ipv4Addr,
-    rcvbuf_bytes: usize,
-) -> std::io::Result<RawFd> {
+pub fn open_capture_socket(cfg: &AppConfig, local_ip: Ipv4Addr) -> std::io::Result<RawFd> {
+    let iface = cfg.iface.as_str();
     let c_iface = CString::new(iface)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid iface name"))?;
     let ifindex = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
@@ -80,7 +77,7 @@ pub fn open_capture_socket(
     }
 
     // Set receive buffer size (best-effort if capped by rmem_max)
-    let rcvbuf = rcvbuf_bytes.min(i32::MAX as usize) as libc::c_int;
+    let rcvbuf = cfg.rcvbuf_bytes.min(i32::MAX as usize) as libc::c_int;
     unsafe {
         libc::setsockopt(
             fd,
@@ -92,7 +89,7 @@ pub fn open_capture_socket(
     }
 
     // Attach cBPF before binding so unfiltered frames never enter the socket queue
-    let filter = build_ipv4_tcp_80_443_filter(local_ip);
+    let filter = build_ipv4_tcp_filter(local_ip, &cfg.inbound_ports);
     if let Err(e) = attach_filter(fd, &filter) {
         unsafe { libc::close(fd) };
         return Err(e);
@@ -248,6 +245,7 @@ pub fn run_capture_loop(
                 guard.preexisting_gap_bytes = tracker.preexisting_gap_bytes;
                 guard.flow_limit_drops = tracker.flow_limit_drops;
                 guard.pending_budget_drops = tracker.pending_budget_drops;
+                guard.source_limit_drops = tracker.source_limit_drops();
             }
         }
 

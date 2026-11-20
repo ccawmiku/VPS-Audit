@@ -3,12 +3,14 @@ pub mod domain;
 #[cfg(target_os = "linux")]
 pub mod linux_capture;
 pub mod protocol;
+mod source;
 
 use crate::collector::domain::{UNIDENTIFIED_DOMAIN, extract_root_domain};
 use crate::collector::protocol::{
     ParseDecision, PrefixReassembler, ReasmStatus, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN,
     extract_domain_from_prefix, parse_ethernet_ipv4_tcp,
 };
+use crate::collector::source::SourceTracker;
 use crate::config::AppConfig;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -63,14 +65,23 @@ pub struct RecentAcc {
 }
 
 #[derive(Debug, Default)]
+pub struct SourceAcc {
+    pub conn_count: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Default)]
 pub struct FlushBatch {
     pub buckets: HashMap<(i64, String), BucketAcc>,
     pub recent: HashMap<RecentKey, RecentAcc>,
+    pub sources: HashMap<(i64, u16, Ipv4Addr), SourceAcc>,
 }
 
 impl FlushBatch {
     pub fn is_empty(&self) -> bool {
-        self.buckets.is_empty() && self.recent.is_empty()
+        self.buckets.is_empty() && self.recent.is_empty() && self.sources.is_empty()
     }
 
     pub fn merge_from(&mut self, other: FlushBatch) {
@@ -94,6 +105,13 @@ impl FlushBatch {
                 })
                 .or_insert(v);
         }
+        for (key, delta) in other.sources {
+            let entry = self.sources.entry(key).or_default();
+            entry.conn_count += delta.conn_count;
+            entry.upload_bytes += delta.upload_bytes;
+            entry.download_bytes += delta.download_bytes;
+            entry.last_seen = entry.last_seen.max(delta.last_seen);
+        }
     }
 }
 
@@ -104,6 +122,9 @@ pub struct CollectorStatus {
     pub web_only: bool,
     pub iface: String,
     pub local_ip: String,
+    pub inbound_port: Option<u16>,
+    pub inbound_ports: Vec<u16>,
+    pub source_limit_drops: u64,
     pub started_at: i64,
     pub uptime_sec: u64,
     pub socket_packets_total: u64,
@@ -133,6 +154,9 @@ impl CollectorStatus {
             local_ip: local_ip
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "未检测".to_string()),
+            inbound_port: cfg.inbound_ports.first().copied(),
+            inbound_ports: cfg.inbound_ports.clone(),
+            source_limit_drops: 0,
             started_at,
             uptime_sec: 0,
             socket_packets_total: 0,
@@ -193,6 +217,7 @@ pub struct FlowTracker {
     global_pending_bytes: usize,
 
     flush_batch: FlushBatch,
+    source_tracker: Option<SourceTracker>,
 
     // Cumulative metrics
     pub parsed_packets_total: u64,
@@ -218,6 +243,8 @@ impl FlowTracker {
             pending_flows_count: 0,
             global_pending_bytes: 0,
             flush_batch: FlushBatch::default(),
+            source_tracker: (!cfg.inbound_ports.is_empty())
+                .then(|| SourceTracker::new(cfg.inbound_ports.clone())),
             parsed_packets_total: 0,
             syn_flows_total: 0,
             resolved_flows_total: 0,
@@ -234,6 +261,16 @@ impl FlowTracker {
         let Some(tcp) = parse_ethernet_ipv4_tcp(pkt) else {
             return;
         };
+        if let Some(sources) = &mut self.source_tracker {
+            sources.observe(
+                &tcp,
+                direction,
+                self.local_ip,
+                now,
+                unix_ts,
+                &mut self.flush_batch,
+            );
+        }
 
         // Defense-in-depth directional & port verification in userspace
         let key = match direction {
@@ -559,6 +596,9 @@ impl FlowTracker {
 
     /// Expires pending domain timers (3s) and closed/idle flows.
     pub fn expire(&mut self, now: Instant, unix_ts: i64) {
+        if let Some(sources) = &mut self.source_tracker {
+            sources.expire(now);
+        }
         let mut timed_out_pending = Vec::new();
         let mut to_remove = Vec::new();
         let closing_grace = Duration::from_secs(CLOSING_GRACE_SECS);
@@ -590,6 +630,13 @@ impl FlowTracker {
 
     pub fn take_flush_batch(&mut self) -> FlushBatch {
         std::mem::take(&mut self.flush_batch)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn source_limit_drops(&self) -> u64 {
+        self.source_tracker
+            .as_ref()
+            .map_or(0, |sources| sources.limit_drops)
     }
 
     pub fn active_flows(&self) -> usize {
@@ -676,7 +723,7 @@ pub fn start_capture_thread(
     shutdown: Arc<AtomicBool>,
     worker_failure: Arc<Notify>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let fd = linux_capture::open_capture_socket(&cfg.iface, local_ip, cfg.rcvbuf_bytes)?;
+    let fd = linux_capture::open_capture_socket(&cfg, local_ip)?;
     Ok(std::thread::Builder::new()
         .name("af-packet-capture".to_string())
         .spawn(move || {
@@ -746,7 +793,9 @@ mod tests {
             instance_name: None,
             iface: "eth0".into(),
             local_ip: Some(Ipv4Addr::new(10, 1, 1, 4)),
+            inbound_ports: Vec::new(),
             db_path: ":memory:".into(),
+            geoip_db: None,
             listen: "127.0.0.1:18080".parse().unwrap(),
             max_flow_prefix_bytes: 16 * 1024,
             pending_timeout_secs: 3,
@@ -759,6 +808,65 @@ mod tests {
             bucket_retention_days: 90,
             web_only: false,
         }
+    }
+
+    #[test]
+    fn source_tracker_counts_matching_ack_once_and_excludes_outbound_flows() {
+        let mut cfg = test_cfg();
+        cfg.inbound_ports = vec![443, 2443];
+        let local = cfg.local_ip.unwrap();
+        let client = Ipv4Addr::new(203, 0, 113, 15);
+        let mut tracker = FlowTracker::new(local, &cfg);
+        let now = Instant::now();
+        let ts = 1_795_000_204;
+        let mut reply = make_tcp_pkt(local, client, 443, 56000, 200, TCP_SYN | TCP_ACK, None, &[]);
+        reply[42..46].copy_from_slice(&101_u32.to_be_bytes());
+        let mut ack = make_tcp_pkt(client, local, 56000, 443, 101, TCP_ACK, None, &[]);
+
+        tracker.handle_packet(&reply, Direction::Outbound, now, ts);
+        tracker.handle_packet(&ack, Direction::Inbound, now, ts);
+        assert!(tracker.take_flush_batch().is_empty());
+
+        ack[42..46].copy_from_slice(&201_u32.to_be_bytes());
+        tracker.handle_packet(&ack, Direction::Inbound, now, ts + 1);
+        tracker.handle_packet(&reply, Direction::Outbound, now, ts + 2);
+        tracker.handle_packet(&ack, Direction::Inbound, now, ts + 2);
+
+        let batch = tracker.take_flush_batch();
+        let row = &batch.sources[&(align_bucket(ts), 443, client)];
+        assert_eq!(row.conn_count, 1);
+        assert_eq!(row.last_seen, ts + 1);
+        assert!(batch.buckets.is_empty());
+
+        let upload = make_tcp_pkt(client, local, 56000, 443, 101, TCP_ACK, None, b"upload");
+        let download = make_tcp_pkt(local, client, 443, 56000, 201, TCP_ACK, None, b"down");
+        tracker.handle_packet(&upload, Direction::Inbound, now, ts + 3);
+        tracker.handle_packet(&download, Direction::Outbound, now, ts + 3);
+        let batch = tracker.take_flush_batch();
+        let row = &batch.sources[&(align_bucket(ts), 443, client)];
+        assert_eq!(
+            (row.upload_bytes, row.download_bytes, row.conn_count),
+            (6, 4, 0)
+        );
+        assert_eq!(row.last_seen, ts + 3);
+        assert!(batch.buckets.is_empty());
+
+        // The same client tuple can connect to a second local inbound independently.
+        reply[34..36].copy_from_slice(&2443_u16.to_be_bytes());
+        ack[36..38].copy_from_slice(&2443_u16.to_be_bytes());
+        tracker.handle_packet(&reply, Direction::Outbound, now, ts + 4);
+        tracker.handle_packet(&ack, Direction::Inbound, now, ts + 5);
+        let batch = tracker.take_flush_batch();
+        assert_eq!(
+            batch.sources[&(align_bucket(ts), 2443, client)].conn_count,
+            1
+        );
+        assert_eq!(batch.sources.len(), 1);
+
+        let later = now + Duration::from_secs(31);
+        tracker.expire(later, ts + 31);
+        tracker.handle_packet(&ack, Direction::Inbound, later, ts + 31);
+        assert!(tracker.take_flush_batch().is_empty());
     }
 
     #[test]

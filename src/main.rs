@@ -1,11 +1,12 @@
 mod collector;
 mod config;
+mod geo;
 mod storage;
 mod web;
 
 use clap::Parser;
 use collector::{CollectorStatus, FlushBatch, start_capture_thread, unix_now};
-use config::AppConfig;
+use config::{AppConfig, MAX_INBOUND_PORTS};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
@@ -70,7 +71,16 @@ async fn main() {
         )
         .init();
 
-    let cfg = AppConfig::parse();
+    let mut cfg = AppConfig::parse();
+    cfg.inbound_ports.sort_unstable();
+    cfg.inbound_ports.dedup();
+    if cfg.inbound_ports.len() > MAX_INBOUND_PORTS {
+        tracing::error!(
+            max_ports = MAX_INBOUND_PORTS,
+            "too many inbound ports for the capture filter"
+        );
+        std::process::exit(1);
+    }
     if !cfg.listen.ip().is_loopback() {
         tracing::error!(listen = %cfg.listen, "the audit UI must listen on loopback");
         std::process::exit(1);
@@ -136,9 +146,19 @@ async fn main() {
 
     drop(tx_flush);
 
+    let country_db = cfg.geoip_db.as_ref().and_then(|path| {
+        match geo::CountryDb::open_readfile(path) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "source geolocation unavailable");
+                None
+            }
+        }
+    });
     let app = build_router(AppState {
         db_path: cfg.db_path.clone(),
         status: status.clone(),
+        country_db,
     });
 
     let listener = match tokio::net::TcpListener::bind(cfg.listen).await {

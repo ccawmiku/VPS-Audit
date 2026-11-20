@@ -2,9 +2,16 @@ use clap::Parser;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+// The classic BPF fallback jump to the inbound port checks uses ports.len() + 6.
+pub const MAX_INBOUND_PORTS: usize = u8::MAX as usize - 6;
+
 /// CLI & environment configuration for `vless-audit`.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "vless-audit", version, about = "Passive AF_PACKET TCP 80/443 traffic & domain auditor")]
+#[command(
+    name = "vless-audit",
+    version,
+    about = "Passive AF_PACKET traffic, domain and inbound source auditor"
+)]
 pub struct AppConfig {
     /// Optional name shown in the audit dashboard.
     #[arg(long, env = "VLESS_AUDIT_INSTANCE_NAME")]
@@ -18,9 +25,17 @@ pub struct AppConfig {
     #[arg(long, env = "VLESS_AUDIT_LOCAL_IP")]
     pub local_ip: Option<Ipv4Addr>,
 
+    /// Local TCP ports of direct VLESS inbounds to audit, comma-separated.
+    #[arg(long = "inbound-port", env = "VLESS_AUDIT_INBOUND_PORT", value_delimiter = ',', value_parser = clap::value_parser!(u16).range(1..))]
+    pub inbound_ports: Vec<u16>,
+
     /// Path to SQLite database file.
     #[arg(long, env = "VLESS_AUDIT_DB", default_value = "/var/lib/vless-audit/audit.db")]
     pub db_path: PathBuf,
+
+    /// Optional local MMDB country database for source IP geolocation.
+    #[arg(long, env = "VLESS_AUDIT_GEOIP_DB")]
+    pub geoip_db: Option<PathBuf>,
 
     /// Local listen address for Web UI & API (keep on loopback behind Cloudflare Tunnel).
     #[arg(long, env = "VLESS_AUDIT_LISTEN", default_value = "127.0.0.1:18080")]

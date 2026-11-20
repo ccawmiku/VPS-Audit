@@ -48,44 +48,10 @@ const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
-/// Builds a classic BPF filter matching Ethernet + IPv4 + non-fragmented TCP on ports 80/443
-/// for `local_ip`, returning `OUTBOUND_SNAPLEN` for outbound packets and `INBOUND_SNAPLEN` for inbound.
-pub fn build_ipv4_tcp_80_443_filter(local_ip: Ipv4Addr) -> Vec<SockFilter> {
+/// Matches web traffic and, when configured, headers for a local inbound.
+pub fn build_ipv4_tcp_filter(local_ip: Ipv4Addr, inbound_ports: &[u16]) -> Vec<SockFilter> {
     let ip_u32 = u32::from(local_ip);
-
-    // Instruction layout (indices 0..=21):
-    //  0: ldh  [12]              ; EtherType
-    //  1: jeq  #0x0800, +0, L_DROP(21)
-    //  2: ldb  [23]              ; IPv4 protocol
-    //  3: jeq  #6, +0, L_DROP(21)
-    //  4: ldh  [20]              ; IPv4 flags + frag_off
-    //  5: jset #0x3fff, L_DROP(21), +0
-    //  6: ldx  4*([14]&0xf)      ; X = IPv4 IHL bytes
-    //  7: txa                    ; A = X
-    //  8: jge  #20, +0, L_DROP(21)
-    //  9: ld   [26]              ; IPv4 src_ip
-    // 10: jeq  #local_ip, +0, L_INBOUND(16)
-    // 11: ld   [30]              ; (outbound) IPv4 dst_ip
-    // 12: jeq  #local_ip, L_DROP(21), +0
-    // 13: ldh  [x+16]            ; TCP dst_port
-    // 14: jeq  #443, L_OUT(20), +0
-    // 15: jeq  #80, L_OUT(20), L_DROP(21)
-    // 16: ld   [30]              ; (inbound) IPv4 dst_ip
-    // 17: jeq  #local_ip, +0, L_DROP(21)
-    // 18: ldh  [x+14]            ; TCP src_port
-    // 19: jeq  #443, L_IN(22), L_IN_80(23)
-    // 20: ret  #OUTBOUND_SNAPLEN
-    // 21: ret  #0
-    // 22: ret  #INBOUND_SNAPLEN
-    // 23: jeq  #80, L_IN(22), L_DROP(21)
-    // Wait: let's keep returns contiguous at the end and make jumps crystal clear:
-    // 19: jeq  #443, L_IN(22), +0
-    // 20: jeq  #80, L_IN(22), L_DROP(23)
-    // 21: ret  #OUTBOUND_SNAPLEN
-    // 22: ret  #INBOUND_SNAPLEN
-    // 23: ret  #0
-
-    vec![
+    let mut program = vec![
         // 0..1: EtherType == IPv4 (0x0800)
         bpf_stmt(BPF_LD | BPF_H | BPF_ABS, 12),
         bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 0x0800, 0, 21), // jf -> 23 (1 + 1 + 21 = 23)
@@ -122,7 +88,27 @@ pub fn build_ipv4_tcp_80_443_filter(local_ip: Ipv4Addr) -> Vec<SockFilter> {
         bpf_stmt(BPF_RET | BPF_K, INBOUND_SNAPLEN),
         // 23: drop
         bpf_stmt(BPF_RET | BPF_K, 0),
-    ]
+    ];
+
+    if !inbound_ports.is_empty() {
+        // The original web checks fall through to the local source/destination port checks.
+        for (web_fallback, local_port_offset) in [(15, 14), (20, 16)] {
+            program[web_fallback].jf = (program.len() - web_fallback - 1) as u8;
+            program.push(bpf_stmt(BPF_LD | BPF_H | BPF_IND, local_port_offset));
+            for (index, &port) in inbound_ports.iter().enumerate() {
+                let accept = (inbound_ports.len() - index) as u8;
+                program.push(bpf_jump(
+                    BPF_JMP | BPF_JEQ | BPF_K,
+                    u32::from(port),
+                    accept,
+                    0,
+                ));
+            }
+            program.push(bpf_stmt(BPF_RET | BPF_K, 0));
+            program.push(bpf_stmt(BPF_RET | BPF_K, INBOUND_SNAPLEN));
+        }
+    }
+    program
 }
 
 #[cfg(target_os = "linux")]
@@ -257,7 +243,7 @@ mod tests {
         let local = Ipv4Addr::new(10, 1, 1, 4);
         let remote = Ipv4Addr::new(93, 184, 216, 34);
         let client = Ipv4Addr::new(203, 0, 113, 9);
-        let prog = build_ipv4_tcp_80_443_filter(local);
+        let prog = build_ipv4_tcp_filter(local, &[]);
 
         // Outbound HTTPS & HTTP -> OUTBOUND_SNAPLEN
         let out_443 = make_eth_ipv4_tcp(local, remote, 54321, 443, 5, 0x4000, 6, 0x0800);
@@ -303,5 +289,32 @@ mod tests {
         // Malformed IHL < 5 -> DROP
         let bad_ihl = make_eth_ipv4_tcp(local, remote, 54324, 443, 4, 0, 6, 0x0800);
         assert_eq!(eval_cbpf(&prog, &bad_ihl), 0);
+    }
+
+    #[test]
+    fn configured_inbound_passes_tunnel_headers_and_preserves_web_capture() {
+        use super::super::protocol::{TCP_ACK, TCP_SYN};
+
+        let local = Ipv4Addr::new(192, 0, 2, 10);
+        let client = Ipv4Addr::new(198, 51, 100, 15);
+        let port = 8443;
+        let prog = build_ipv4_tcp_filter(local, &[2443, port]);
+        let mut response = make_eth_ipv4_tcp(local, client, port, 50000, 6, 0, 6, 0x0800);
+        response[14 + 24 + 13] = TCP_SYN | TCP_ACK;
+        assert_eq!(eval_cbpf(&prog, &response), INBOUND_SNAPLEN);
+        assert_eq!(eval_cbpf(&build_ipv4_tcp_filter(local, &[]), &response), 0);
+        response[14 + 24 + 13] = TCP_ACK;
+        assert_eq!(eval_cbpf(&prog, &response), INBOUND_SNAPLEN);
+
+        let mut ack = make_eth_ipv4_tcp(client, local, 50000, port, 5, 0, 6, 0x0800);
+        ack[14 + 20 + 13] = TCP_ACK;
+        assert_eq!(eval_cbpf(&prog, &ack), INBOUND_SNAPLEN);
+        ack[36..38].copy_from_slice(&2443_u16.to_be_bytes());
+        assert_eq!(eval_cbpf(&prog, &ack), INBOUND_SNAPLEN);
+        ack[36..38].copy_from_slice(&22_u16.to_be_bytes());
+        assert_eq!(eval_cbpf(&prog, &ack), 0);
+
+        let web = make_eth_ipv4_tcp(local, client, 50000, 443, 5, 0, 6, 0x0800);
+        assert_eq!(eval_cbpf(&prog, &web), OUTBOUND_SNAPLEN);
     }
 }

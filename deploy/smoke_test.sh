@@ -22,8 +22,14 @@ done
 echo "healthz: $(curl -fsS "http://127.0.0.1:$PORT/healthz")"
 curl -fsS "http://127.0.0.1:$PORT/" | grep -q "VLESS 旁路流量审计"
 echo "index.html: OK"
+curl -fsSI "http://127.0.0.1:$PORT/dashboard.css" | grep -qi '^content-type: text/css'
+curl -fsSI "http://127.0.0.1:$PORT/dashboard.js" | grep -qi '^content-type: text/javascript'
+echo "embedded CSS and JS: OK"
 status="$(curl -fsS "http://127.0.0.1:$PORT/api/status")"
 grep -Fq '"instance_name":"Smoke Test"' <<< "$status"
 echo "status: $status"
 echo "overview: $(curl -fsS "http://127.0.0.1:$PORT/api/overview")"
 echo "recent: $(curl -fsS "http://127.0.0.1:$PORT/api/recent")"
+sources="$(curl -fsS "http://127.0.0.1:$PORT/api/sources")"
+grep -Fq '"unique_ips":0' <<< "$sources"
+echo "sources: $sources"

@@ -14,6 +14,7 @@ pub struct ParsedTcpPacket<'a> {
     pub src_port: u16,
     pub dst_port: u16,
     pub seq: u32,
+    pub ack: u32,
     pub flags: u8,
     pub payload_len: u64,
     pub captured_payload: &'a [u8],
@@ -57,6 +58,7 @@ pub fn parse_ethernet_ipv4_tcp(pkt: &[u8]) -> Option<ParsedTcpPacket<'_>> {
     let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
     let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
     let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
     let doff = ((tcp[12] >> 4) as usize) * 4;
     let flags = tcp[13];
 
@@ -83,6 +85,7 @@ pub fn parse_ethernet_ipv4_tcp(pkt: &[u8]) -> Option<ParsedTcpPacket<'_>> {
         src_port,
         dst_port,
         seq,
+        ack,
         flags,
         payload_len,
         captured_payload,

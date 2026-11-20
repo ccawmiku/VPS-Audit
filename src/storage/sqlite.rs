@@ -1,7 +1,10 @@
-use crate::collector::domain::{UNIDENTIFIED_DOMAIN, service_label};
+use crate::collector::domain::{TrafficKind, UNIDENTIFIED_DOMAIN, service_label, traffic_kind};
 use crate::collector::{CollectorStatus, FlushBatch, align_bucket, unix_now};
+use crate::geo::{CountryDb, country_code};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, RwLock, mpsc::Receiver};
 use std::time::{Duration, Instant};
@@ -46,6 +49,13 @@ pub struct OverviewResponse {
     pub summary: OverviewSummary,
     pub timeline: Vec<TimelinePoint>,
     pub domains: Vec<DomainRankRow>,
+    pub traffic_types: Vec<TrafficShare>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficShare {
+    pub kind: TrafficKind,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,15 +81,45 @@ pub struct RecentDomainRow {
     pub last_seen: i64,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct SourcesResponse {
+    pub unique_ips: u64,
+    pub total_conns: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub latest_seen: Option<i64>,
+    pub regions: Option<Vec<SourceRegion>>,
+    pub rows: Vec<SourceRankRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceRegion {
+    pub country_code: Option<String>,
+    pub unique_ips: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceRankRow {
+    pub ip: String,
+    pub country_code: Option<String>,
+    pub ports: String,
+    pub conn_count: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub last_seen: i64,
+}
+
 pub fn init_schema(db_path: &Path) -> rusqlite::Result<()> {
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
-    let conn = open_rw(db_path)?;
+    let mut conn = open_rw(db_path)?;
     configure_connection(&conn)?;
-    conn.execute_batch(
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS traffic_buckets (
             bucket_ts   INTEGER NOT NULL,
@@ -107,9 +147,32 @@ pub fn init_schema(db_path: &Path) -> rusqlite::Result<()> {
             ON recent_domains(root_domain, bucket_ts);
         CREATE INDEX IF NOT EXISTS idx_recent_last_seen
             ON recent_domains(last_seen DESC);
+
+        CREATE TABLE IF NOT EXISTS source_buckets (
+            bucket_ts    INTEGER NOT NULL,
+            inbound_port INTEGER NOT NULL,
+            source_ip    INTEGER NOT NULL,
+            conn_count   INTEGER NOT NULL,
+            last_seen    INTEGER NOT NULL,
+            upload_bytes INTEGER NOT NULL DEFAULT 0,
+            download_bytes INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_ts, inbound_port, source_ip)
+        ) WITHOUT ROWID;
         "#,
     )?;
-    Ok(())
+    for column in ["upload_bytes", "download_bytes"] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('source_buckets') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute_batch(&format!(
+                "ALTER TABLE source_buckets ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            ))?;
+        }
+    }
+    tx.commit()
 }
 
 fn open_rw(db_path: &Path) -> rusqlite::Result<Connection> {
@@ -234,6 +297,33 @@ pub fn write_batch(conn: &mut Connection, batch: &FlushBatch) -> rusqlite::Resul
         }
     }
 
+    if !batch.sources.is_empty() {
+        let mut stmt_source = tx.prepare_cached(
+            r#"
+            INSERT INTO source_buckets (
+                bucket_ts, inbound_port, source_ip, conn_count, last_seen, upload_bytes, download_bytes
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(bucket_ts, inbound_port, source_ip) DO UPDATE SET
+                conn_count = conn_count + excluded.conn_count,
+                last_seen  = MAX(last_seen, excluded.last_seen),
+                upload_bytes = upload_bytes + excluded.upload_bytes,
+                download_bytes = download_bytes + excluded.download_bytes
+            "#,
+        )?;
+        for ((bucket, port, ip), acc) in &batch.sources {
+            stmt_source.execute(params![
+                bucket,
+                port,
+                u32::from(*ip),
+                acc.conn_count as i64,
+                acc.last_seen,
+                acc.upload_bytes as i64,
+                acc.download_bytes as i64
+            ])?;
+        }
+    }
+
     tx.commit()
 }
 
@@ -251,6 +341,10 @@ pub fn cleanup_old_rows(
     )?;
     conn.execute(
         "DELETE FROM traffic_buckets WHERE bucket_ts < ?1",
+        params![bucket_cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM source_buckets WHERE bucket_ts < ?1",
         params![bucket_cutoff],
     )?;
     Ok(())
@@ -299,11 +393,15 @@ pub fn query_overview(
         ))
     })?;
 
+    let mut types = HashMap::new();
     for item in rows {
         let (root, tx, rx, conns) = item?;
         total_tx += tx;
         total_rx += rx;
         total_conns += conns;
+        if tx + rx > 0 {
+            *types.entry(traffic_kind(&root)).or_insert(0) += tx + rx;
+        }
         if root == UNIDENTIFIED_DOMAIN {
             unid_tx += tx;
             unid_rx += rx;
@@ -314,6 +412,15 @@ pub fn query_overview(
     let grand_total = (total_tx + total_rx).max(1) as f64;
     let active_root_domains =
         raw_domains.len() - usize::from(raw_domains.iter().any(|row| row.0 == UNIDENTIFIED_DOMAIN));
+    let mut traffic_types: Vec<_> = types
+        .into_iter()
+        .map(|(kind, total_bytes)| TrafficShare { kind, total_bytes })
+        .collect();
+    traffic_types.sort_unstable_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
 
     let domains: Vec<DomainRankRow> = raw_domains
         .into_iter()
@@ -393,6 +500,7 @@ pub fn query_overview(
         },
         timeline,
         domains,
+        traffic_types,
     })
 }
 
@@ -464,10 +572,11 @@ pub fn query_recent(db_path: &Path, limit: usize) -> rusqlite::Result<Vec<Recent
     )?;
 
     let rows = stmt.query_map(params![lim], |row| {
+        let full: String = row.get(0)?;
         let root: String = row.get(1)?;
-        let label = service_label(&root);
+        let label = service_label(&full).or_else(|| service_label(&root));
         Ok(RecentDomainRow {
-            full_domain: row.get(0)?,
+            full_domain: full,
             root_domain: root,
             service_label: label,
             ech_ext: row.get::<_, i64>(2)? > 0,
@@ -483,6 +592,94 @@ pub fn query_recent(db_path: &Path, limit: usize) -> rusqlite::Result<Vec<Recent
         out.push(item?);
     }
     Ok(out)
+}
+
+pub fn query_sources(
+    db_path: &Path,
+    from_ts: i64,
+    to_ts: i64,
+    ip: Option<Ipv4Addr>,
+    country_db: Option<&CountryDb>,
+) -> rusqlite::Result<SourcesResponse> {
+    const RANK_LIMIT: usize = 200;
+    let conn = open_ro(db_path)?;
+    let mut stmt = conn.prepare(
+        r#"
+        WITH ranked AS (
+            SELECT source_ip, GROUP_CONCAT(DISTINCT inbound_port) AS ports,
+                   SUM(conn_count) AS conns, MAX(last_seen) AS last_seen,
+                   SUM(upload_bytes) AS upload, SUM(download_bytes) AS download
+            FROM source_buckets
+            WHERE bucket_ts BETWEEN ?1 AND ?2 AND (?3 IS NULL OR source_ip = ?3)
+            GROUP BY source_ip
+        )
+        SELECT source_ip, ports, conns, last_seen, upload, download,
+               COUNT(*) OVER (), SUM(conns) OVER (), MAX(last_seen) OVER (),
+               SUM(upload) OVER (), SUM(download) OVER ()
+        FROM ranked
+        ORDER BY (upload + download) DESC, conns DESC, last_seen DESC, source_ip
+        LIMIT ?4
+        "#,
+    )?;
+    let mut rows = stmt.query(params![
+        align_bucket(from_ts),
+        align_bucket(to_ts),
+        ip.map(u32::from),
+        if country_db.is_some() {
+            -1
+        } else {
+            RANK_LIMIT as i64
+        }
+    ])?;
+    let mut result = SourcesResponse::default();
+    let mut regions = HashMap::<Option<String>, (u64, u64)>::new();
+    while let Some(row) = rows.next()? {
+        if result.rows.is_empty() {
+            result.unique_ips = row.get::<_, i64>(6)? as u64;
+            result.total_conns = row.get::<_, i64>(7)? as u64;
+            result.latest_seen = row.get(8)?;
+            result.upload_bytes = row.get::<_, i64>(9)? as u64;
+            result.download_bytes = row.get::<_, i64>(10)? as u64;
+        }
+        let ip = Ipv4Addr::from(row.get::<_, u32>(0)?);
+        let upload_bytes = row.get::<_, i64>(4)? as u64;
+        let download_bytes = row.get::<_, i64>(5)? as u64;
+        let location = country_db.and_then(|db| country_code(db, ip));
+        if country_db.is_some() {
+            let (ips, bytes) = regions.entry(location.clone()).or_default();
+            *ips += 1;
+            *bytes += upload_bytes + download_bytes;
+        }
+        if result.rows.len() < RANK_LIMIT {
+            result.rows.push(SourceRankRow {
+                ip: ip.to_string(),
+                country_code: location,
+                ports: row.get(1)?,
+                conn_count: row.get::<_, i64>(2)? as u64,
+                last_seen: row.get(3)?,
+                upload_bytes,
+                download_bytes,
+            });
+        }
+    }
+    result.regions = country_db.map(|_| {
+        let mut regions: Vec<_> = regions
+            .into_iter()
+            .map(|(country_code, (unique_ips, total_bytes))| SourceRegion {
+                country_code,
+                unique_ips,
+                total_bytes,
+            })
+            .collect();
+        regions.sort_unstable_by(|a, b| {
+            b.total_bytes
+                .cmp(&a.total_bytes)
+                .then_with(|| b.unique_ips.cmp(&a.unique_ips))
+                .then_with(|| a.country_code.cmp(&b.country_code))
+        });
+        regions
+    });
+    Ok(result)
 }
 
 pub fn db_size_bytes(db_path: &Path) -> u64 {
@@ -505,7 +702,22 @@ mod tests {
             unix_now()
         ));
         let db_path = dir.join("audit.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = Connection::open(&db_path).unwrap();
+        legacy.execute_batch(
+            "CREATE TABLE source_buckets (
+                bucket_ts INTEGER NOT NULL, inbound_port INTEGER NOT NULL, source_ip INTEGER NOT NULL,
+                conn_count INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                PRIMARY KEY (bucket_ts, inbound_port, source_ip)
+            ) WITHOUT ROWID;
+            INSERT INTO source_buckets VALUES (1794999600, 443, 3405803818, 3, 1794999660);",
+        ).unwrap();
+        drop(legacy);
         init_schema(&db_path).unwrap();
+        init_schema(&db_path).unwrap();
+        let migrated = query_sources(&db_path, 1_794_999_600, 1_794_999_600, None, None).unwrap();
+        assert_eq!(migrated.total_conns, 3);
+        assert_eq!((migrated.upload_bytes, migrated.download_bytes), (0, 0));
 
         let mut conn = open_rw(&db_path).unwrap();
         configure_connection(&conn).unwrap();
@@ -543,7 +755,44 @@ mod tests {
             },
         );
 
+        let source_ip: Ipv4Addr = "203.0.113.42".parse().unwrap();
+        let mut source_batch = FlushBatch::default();
+        source_batch.sources.insert(
+            (bts, 443, source_ip),
+            crate::collector::SourceAcc {
+                conn_count: 2,
+                last_seen: bts + 5,
+                upload_bytes: 100,
+                download_bytes: 300,
+            },
+        );
+        write_batch(&mut conn, &source_batch).unwrap();
+        let source = batch.sources.entry((bts, 443, source_ip)).or_default();
+        source.conn_count = 1;
+        source.last_seen = bts + 10;
+        source.upload_bytes = 20;
+        source.download_bytes = 10;
+        let second_ip: Ipv4Addr = "198.51.100.20".parse().unwrap();
+        let second_source = batch.sources.entry((bts, 443, second_ip)).or_default();
+        second_source.conn_count = 1;
+        second_source.last_seen = bts + 12;
         write_batch(&mut conn, &batch).unwrap();
+
+        let sources = query_sources(&db_path, bts, bts + 12, None, None).unwrap();
+        assert_eq!(sources.unique_ips, 2);
+        assert_eq!(sources.total_conns, 4);
+        assert_eq!(sources.latest_seen, Some(bts + 12));
+        assert_eq!((sources.upload_bytes, sources.download_bytes), (120, 310));
+        assert_eq!(sources.rows[0].ip, "203.0.113.42");
+        assert_eq!(sources.rows[0].ports, "443");
+        assert_eq!(sources.rows[0].last_seen, bts + 10);
+        assert_eq!(
+            (sources.rows[0].upload_bytes, sources.rows[0].download_bytes),
+            (120, 310)
+        );
+        let matched = query_sources(&db_path, bts, bts + 12, Some(second_ip), None).unwrap();
+        assert_eq!(matched.unique_ips, 1);
+        assert_eq!(matched.total_conns, 1);
 
         let ov = query_overview(&db_path, bts - 300, bts + 300, 300).unwrap();
         assert_eq!(ov.summary.total_tx_bytes, 1_500);
@@ -551,6 +800,15 @@ mod tests {
         assert_eq!(ov.summary.unidentified_tx_bytes, 500);
         assert_eq!(ov.domains[0].root_domain, "youtube.com");
         assert_eq!(ov.domains[0].service_label, Some("YouTube"));
+        assert_eq!(
+            ov.traffic_types
+                .iter()
+                .map(|row| row.total_bytes)
+                .sum::<u64>(),
+            54_000
+        );
+        assert_eq!(ov.traffic_types[0].kind, TrafficKind::Video);
+        assert_eq!(ov.traffic_types[1].kind, TrafficKind::Unidentified);
 
         let details = query_domain_details(&db_path, "youtube.com", bts - 300, bts + 300).unwrap();
         assert_eq!(details.len(), 1);
@@ -574,6 +832,13 @@ mod tests {
         cleanup_old_rows(&conn, bts + 100 * 3600, 48, 90).unwrap();
         let recent_after = query_recent(&db_path, 10).unwrap();
         assert!(recent_after.is_empty());
+        cleanup_old_rows(&conn, bts + 91 * 86_400, 48, 90).unwrap();
+        assert!(
+            query_sources(&db_path, bts, bts + 300, None, None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
 
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
