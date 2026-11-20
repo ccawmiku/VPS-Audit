@@ -56,3 +56,13 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" 
    - Tunnel Public Hostname 指向 `http://127.0.0.1:18080`；
    - 在 Cloudflare Zero Trust 创建独立 Access 应用并关联仅允许指定邮箱的 Reusable Policy；
    - 开启 **Protect with Access**（由 `cloudflared` 校验该应用 JWT）。
+
+### 可选入站 IP 屏蔽
+
+Debian 13 可以随 Audit 安装可选的防火墙组件。它需要系统自带 Python 3 和 nftables，安装脚本旁需保留 `vless-audit-blocklist` 及其 `.service`、`.path`、`.timer` 文件。
+
+```bash
+sudo ./deploy/install.sh ./dist/vless-audit ./deploy/vless-audit.service 127.0.0.1:18080 --with-blocklist
+```
+
+初次安装默认为关闭。在「来源 IP」页开启后，系统服务下载 [Spamhaus DROP](https://www.spamhaus.org/blocklists/do-not-route-or-peer/) 的 IPv4、IPv6 名单，只匹配 `VLESS_AUDIT_IFACE` 上发往 `VLESS_AUDIT_INBOUND_PORT` 的入站 TCP。接口和端口须与 Audit 的实际采集配置一致。其他防火墙规则照常执行。开启时每天刷新名单，下载或解析失败保留最近一次有效名单。关闭后移除 Audit 的专用防火墙表。

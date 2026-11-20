@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply vless-audit Spamhaus DROP input rules
+After=network-online.target vless-audit.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/vless-audit.env
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/vless-audit-blocklist
+StateDirectory=vless-audit-blocklist
+StateDirectoryMode=0755
+UMask=0077
+TimeoutStartSec=45
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

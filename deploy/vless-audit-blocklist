@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Reconcile the optional Spamhaus DROP input rules for vless-audit."""
+
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tempfile
+import time
+from urllib.request import urlopen
+
+
+REQUEST = Path("/var/lib/vless-audit/blocklist-request")
+STATE = Path("/var/lib/vless-audit-blocklist")
+NFT = "/usr/sbin/nft"
+TABLE = "vless_audit_drop"
+SOURCES = {
+    4: "https://www.spamhaus.org/drop/drop_v4.json",
+    6: "https://www.spamhaus.org/drop/drop_v6.json",
+}
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, value, mode=0o600):
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix="." + path.name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            json.dump(value, stream, separators=(",", ":"))
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def requested():
+    try:
+        fd = os.open(REQUEST, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Invalid request file")
+        content = stream.read(8)
+    if content not in (b"on\n", b"off\n"):
+        raise ValueError("Invalid blocklist request")
+    return content == b"on\n"
+
+
+def scope():
+    iface = os.environ.get("VLESS_AUDIT_IFACE", "eth0")
+    raw = os.environ.get("VLESS_AUDIT_INBOUND_PORT", "")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
+        raise ValueError("Invalid interface")
+    ports = sorted({int(p) for p in raw.split(",")}) if raw else []
+    if any(not 1 <= port <= 65535 for port in ports) or len(ports) > 249:
+        raise ValueError("Invalid inbound port list")
+    return iface, ports
+
+
+def parse_feed(body, version):
+    networks = set()
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("type") == "metadata":
+            continue
+        network = ipaddress.ip_network(record["cidr"])
+        minimum = 8 if version == 4 else 12
+        if network.version != version or network.prefixlen < minimum:
+            raise ValueError("Unexpected network in DROP feed")
+        networks.add(network)
+    if not networks:
+        raise ValueError("Empty DROP feed")
+    return [str(net) for net in ipaddress.collapse_addresses(sorted(networks))]
+
+
+def refresh_feed():
+    now = int(time.time())
+    cache_path = STATE / "cache.json"
+    attempt_path = STATE / "attempt.json"
+    cache = read_json(cache_path)
+    if cache and now - cache["updated_at"] < 86400:
+        return cache, False
+    attempts = read_json(attempt_path)
+    if now - attempts.get("at", 0) < 3600:
+        return cache, True
+    write_json(attempt_path, {"at": now})
+    try:
+        refreshed = {"updated_at": now}
+        for version, url in SOURCES.items():
+            with urlopen(url, timeout=12) as response:
+                body = response.read(4_194_305)
+            if len(body) > 4_194_304:
+                raise ValueError("DROP feed exceeds size limit")
+            refreshed[f"v{version}"] = parse_feed(body, version)
+        write_json(cache_path, refreshed)
+        return refreshed, False
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(f"DROP refresh failed: {error}", flush=True)
+        return cache, True
+
+
+def nft_apply(rules):
+    p = subprocess.run(
+        [NFT, "-f", "-"], input=rules, text=True, capture_output=True, timeout=10
+    )
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip())
+
+
+def table_active():
+    return subprocess.run(
+        [NFT, "list", "table", "inet", TABLE],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+    ).returncode == 0
+
+
+def ruleset(iface, ports, cache):
+    prefix = f"inet {TABLE}"
+    lines = [
+        f"destroy table {prefix}",
+        f"add table {prefix}",
+        f"add chain {prefix} incoming {{ type filter hook input priority -5; policy accept; }}",
+    ]
+    port_set = ", ".join(map(str, ports))
+    for version, protocol in [(4, "ip"), (6, "ip6")]:
+        name = f"targets_v{version}"
+        lines.extend([
+            f"add set {prefix} {name} {{ type ipv{version}_addr; flags interval; auto-merge; }}",
+            f"add element {prefix} {name} {{ {', '.join(cache[f'v{version}'])} }}",
+            f'add rule {prefix} incoming iifname "{iface}" tcp dport {{ {port_set} }} {protocol} saddr @{name} counter drop',
+        ])
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    report_path = STATE / "status.json"
+    previous = read_json(report_path)
+    report = {
+        "interface": "", "ports": [], "processed": False, "active": False,
+        "updated_at": previous.get("updated_at"),
+        "ipv4_ranges": previous.get("ipv4_ranges", 0),
+        "ipv6_ranges": previous.get("ipv6_ranges", 0),
+        "warning": None,
+    }
+    try:
+        enabled = requested()
+        report["processed"] = enabled
+        try:
+            report["interface"], report["ports"] = scope()
+        except ValueError:
+            report["warning"] = "invalid_scope"
+        if not enabled or not report["ports"]:
+            nft_apply(f"destroy table inet {TABLE}\n")
+            if enabled and report["warning"] is None:
+                report["warning"] = "no_ports"
+        else:
+            cache, stale = refresh_feed()
+            if not cache:
+                report["warning"] = "no_feed"
+            else:
+                if (
+                    not previous.get("active")
+                    or previous.get("updated_at") != cache["updated_at"]
+                    or previous.get("interface") != report["interface"]
+                    or previous.get("ports") != report["ports"]
+                    or not table_active()
+                ):
+                    nft_apply(ruleset(report["interface"], report["ports"], cache))
+                report.update(
+                    active=True, updated_at=cache["updated_at"],
+                    ipv4_ranges=len(cache["v4"]), ipv6_ranges=len(cache["v6"]),
+                    warning="stale_feed" if stale else None,
+                )
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"Firewall reconciliation failed: {error}", flush=True)
+        report.update(active=previous.get("active", False), warning="firewall_error")
+    write_json(report_path, report, 0o644)
+
+
+if __name__ == "__main__":
+    main()

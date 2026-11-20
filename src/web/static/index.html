@@ -295,6 +295,13 @@ SOFTWARE.
 
         <section id="viewSources" aria-labelledby="pageTitle" hidden>
           <p class="notice" id="sourcesNotice" hidden></p>
+          <section class="panel blocklist-panel" aria-labelledby="blocklistTitle">
+            <div>
+              <h2 id="blocklistTitle">入站 IP 屏蔽</h2>
+              <p id="blocklistStatus" role="status">正在读取防火墙状态</p>
+            </div>
+            <button type="button" class="button" id="blocklistToggle" role="switch" aria-checked="false" disabled>关闭</button>
+          </section>
           <div class="metrics source-metrics">
             <article class="metric">
               <div class="metric-label"><span class="metric-icon teal"><svg class="icon" aria-hidden="true"><use href="#icon-network"></use></svg></span>独立来源 IP</div>

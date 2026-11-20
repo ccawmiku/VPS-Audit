@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the vless-audit blocklist switch
+After=vless-audit.service
+
+[Path]
+PathChanged=/var/lib/vless-audit/blocklist-request
+
+[Install]
+WantedBy=multi-user.target

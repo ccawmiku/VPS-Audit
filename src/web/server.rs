@@ -7,7 +7,7 @@ use crate::storage::sqlite::{
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,12 @@ struct StatusResponse {
     collector: CollectorStatus,
     db_size_bytes: u64,
     cf_access_user: Option<String>,
+    blocklist: BlocklistStatus,
+}
+
+#[derive(Deserialize)]
+struct BlocklistUpdate {
+    enabled: bool,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -66,6 +72,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/recent", get(api_recent))
         .route("/api/sources", get(api_sources))
         .route("/api/status", get(api_status))
+        .route("/api/blocklist", post(api_set_blocklist))
         .layer(axum::middleware::map_response(
             |mut response: Response| async {
                 response.headers_mut().insert(
@@ -196,6 +203,43 @@ async fn api_domain_timeline(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+async fn api_set_blocklist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(update): Json<BlocklistUpdate>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    // A cross-origin web request requires a CORS preflight for this header.
+    if headers
+        .get("X-Audit-Action")
+        .is_none_or(|value| value != "blocklist")
+    {
+        return Err((StatusCode::FORBIDDEN, "Missing control header"));
+    }
+    let collector = state
+        .status
+        .read()
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Collector unavailable"))?
+        .clone();
+    tokio::task::spawn_blocking(move || {
+        let status = blocklist::status(&collector);
+        if !status.installed || (update.enabled && !status.available) {
+            return Err((
+                StatusCode::CONFLICT,
+                "Blocklist unavailable for this capture configuration",
+            ));
+        }
+        blocklist::set_enabled(update.enabled).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not queue blocklist change",
+            )
+        })?;
+        Ok(StatusCode::ACCEPTED)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Blocklist worker failed"))?
+}
+
 async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {
     let collector = state
         .status
@@ -235,13 +279,18 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<S
         .map(|s| s.to_string());
 
     let db = state.db_path.clone();
-    let db_bytes = tokio::task::spawn_blocking(move || db_size_bytes(&db))
-        .await
-        .unwrap_or(0);
+    let status_collector = collector.clone();
+    let (db_bytes, blocklist) = tokio::task::spawn_blocking(move || {
+        (db_size_bytes(&db), blocklist::status(&status_collector))
+    })
+    .await
+    .unwrap_or_default();
 
     Json(StatusResponse {
         collector,
         db_size_bytes: db_bytes,
         cf_access_user,
+        blocklist,
     })
 }
+use super::blocklist::{self, BlocklistStatus};

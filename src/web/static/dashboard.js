@@ -31,6 +31,9 @@ let requestController;
 let chart;
 let trendDomain = null;
 let domainTimeline = [];
+let blocklistStatus;
+let blocklistSaving = false;
+let blocklistPoll;
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -517,6 +520,7 @@ function renderSourceGeography(data) {
 }
 
 function renderSources(data, status) {
+  renderBlocklist(status.blocklist);
   const ports = status.inbound_ports ?? (status.inbound_port ? [status.inbound_port] : []);
   const notice = $('sourcesNotice');
   notice.hidden = ports.length > 0 && !status.web_only;
@@ -539,6 +543,35 @@ function renderSources(data, status) {
     <td class="num"><strong>${bytes(item.download_bytes + item.upload_bytes)}</strong><small class="compact-traffic">↓ ${bytes(item.download_bytes)} · ↑ ${bytes(item.upload_bytes)}</small></td>
     <td class="num">${number(item.conn_count)}</td><td class="num">${esc(time(item.last_seen))}</td>
   </tr>`).join('') || emptyRow(7, state.searchIp ? '此时段没有该来源 IP 的记录' : '此时段暂无来源 IP 记录');
+}
+
+function renderBlocklist(info) {
+  blocklistStatus = info;
+  clearTimeout(blocklistPoll);
+  const button = $('blocklistToggle');
+  const enabled = Boolean(info?.enabled);
+  button.setAttribute('aria-checked', String(enabled));
+  button.textContent = enabled ? '开启' : '关闭';
+  button.disabled = blocklistSaving || !info?.installed || (!info.available && !enabled) || info.pending;
+  const warnings = {
+    no_feed: '暂未获取到有效名单',
+    stale_feed: '更新失败，继续使用上次有效名单',
+    firewall_error: '防火墙应用失败，请检查服务日志',
+    invalid_scope: '采集接口或端口配置有误',
+    no_ports: '请先配置直连 VLESS 端口'
+  };
+  let message = '防火墙组件未安装';
+  if (info?.installed) {
+    const phase = info.pending ? '等待应用' : info.active ? '已生效' : '已关闭';
+    message = `Spamhaus DROP · ${phase}`;
+    if (info.updated_at != null) message += ` · 名单更新于 ${time(info.updated_at)}`;
+    if (info.warning) message += ` · ${warnings[info.warning] ?? '防火墙状态异常'}`;
+    else if (!info.available) message += ' · 请核对采集接口和直连端口';
+    if (info.pending) blocklistPoll = setTimeout(() => {
+      if (state.view === 'sources') refresh();
+    }, 2200);
+  }
+  setText('blocklistStatus', message);
 }
 
 function setHealth(label, tone) {
@@ -641,6 +674,28 @@ $('sourceForm').addEventListener('submit', (event) => {
   state.searchIp = ip;
   $('sourceError').hidden = true;
   refresh();
+});
+
+$('blocklistToggle').addEventListener('click', async () => {
+  if (!blocklistStatus || blocklistSaving) return;
+  blocklistSaving = true;
+  $('blocklistToggle').disabled = true;
+  setText('blocklistStatus', '正在提交防火墙设置');
+  try {
+    const response = await fetch('/api/blocklist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Audit-Action': 'blocklist' },
+      body: JSON.stringify({ enabled: !blocklistStatus.enabled })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    setText('blocklistStatus', `设置失败 · ${error.message}`);
+    $('blocklistToggle').disabled = false;
+    return;
+  } finally {
+    blocklistSaving = false;
+  }
+  await refresh();
 });
 
 $('sourceFilter').addEventListener('input', () => {

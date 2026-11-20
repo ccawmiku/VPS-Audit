@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile and refresh the optional vless-audit blocklist
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=1h
+
+[Install]
+WantedBy=timers.target
