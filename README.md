@@ -42,6 +42,8 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" 
 
    来源地区的色块按所选时段内各地区的隧道总流量着色，以当期最高流量为最深色。流量总览的类型占比按出站主域名归类，并包含其他域名和未识别流量。最近访问明细可以用完整域名显示更细的服务标签。
 
+   世界地图采用内嵌的 Natural Earth 简化轮廓，按来源地区页需要加载。底图由 [Natural Earth 1:110m 国家轮廓和 1:50m 微小地区点位](https://github.com/nvkelso/natural-earth-vector/tree/v5.1.1/geojson) 生成。流量总览的主域名排行可用「看趋势」在上方图表查看该域名的分时段流量。
+
    来源 IP 页面按隧道总流量排序。上行为客户端发给 VPS 的 TCP 负载，下行为 VPS 发给客户端的 TCP 负载，均包含重传。升级前的连接记录会保留，字节数自启用新版开始累计。完成 TCP 握手的扫描也可能进入统计。经过 Cloudflare Tunnel、其他反代或 NAT 时，页面显示采集网卡实际可见的对端。
 
 2. 验证服务以非 root 用户 `vless-audit`（仅 `CAP_NET_RAW`）运行且仅监听 `127.0.0.1:18080`：

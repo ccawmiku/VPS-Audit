@@ -29,6 +29,8 @@ const navItems = [...document.querySelectorAll('[data-view]')];
 let requestId = 0;
 let requestController;
 let chart;
+let trendDomain = null;
+let domainTimeline = [];
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -117,12 +119,17 @@ async function refresh() {
       ? fetchJson('/api/recent?limit=150', signal) : null;
     const sourceQuery = state.view === 'sources'
       ? fetchJson(`/api/sources?${range}${state.searchIp ? '&ip=' + encodeURIComponent(state.searchIp) : ''}`, signal) : null;
-    const [status, overview, recent, sources] = await Promise.all([statusQuery, overviewQuery, recentQuery, sourceQuery]);
+    const timelineQuery = state.view === 'overview' && trendDomain
+      ? fetchJson(`/api/domain/${encodeURIComponent(trendDomain)}/timeline?${range}`, signal) : null;
+    const [status, overview, recent, sources, timeline] = await Promise.all([
+      statusQuery, overviewQuery, recentQuery, sourceQuery, timelineQuery
+    ]);
     if (id !== requestId) return;
     $('requestError').hidden = true;
     renderStatus(status);
     if (overview) {
       state.overview = overview;
+      domainTimeline = timeline ?? [];
       renderOverview(overview);
     }
     if (recent) {
@@ -159,7 +166,7 @@ function showView() {
     else item.removeAttribute('aria-current');
   }
   closeTooltip();
-  if (state.view === 'overview' && state.overview) renderChart(state.overview);
+  if (state.view === 'overview' && state.overview) renderCurrentChart();
   refresh();
 }
 
@@ -172,9 +179,15 @@ function renderOverview(overview) {
   setText('sumDomains', number(s.active_root_domains));
   setText('sumUnid', `${s.unidentified_ratio_pct.toFixed(1)}%`);
   setText('sumUnidSub', `上下行合计 ${bytes(s.unidentified_tx_bytes + s.unidentified_rx_bytes)}`);
-  renderChart(overview);
+  renderCurrentChart();
   renderTrafficMix(overview.traffic_types ?? [], s.total_rx_bytes + s.total_tx_bytes);
   if (state.domainTab === 'domains') renderDomains();
+}
+
+function renderCurrentChart() {
+  setText('trendTitle', trendDomain ? `流量趋势 · ${trendDomain}` : '流量趋势');
+  $('resetTrendDomain').hidden = !trendDomain;
+  renderChart(trendDomain ? { ...state.overview, timeline: domainTimeline } : state.overview);
 }
 
 const trafficKinds = {
@@ -333,7 +346,8 @@ function renderDomains() {
     const { root_domain: root, share_pct: share } = item;
     const expanded = root === state.expandedRoot;
     return `<tr class="rank-row">
-      <td><button type="button" class="row-toggle" data-root="${esc(root)}" aria-expanded="${expanded}">${icon('chevron-right')}<span class="mono">${esc(root)}</span></button>${tag(item.service_label)}</td>
+      <td><button type="button" class="row-toggle" data-root="${esc(root)}" aria-expanded="${expanded}">${icon('chevron-right')}<span class="mono">${esc(root)}</span></button>${tag(item.service_label)}
+        <button type="button" class="domain-trend" data-trend-root="${esc(root)}" aria-label="查看 ${esc(root)} 的流量趋势" aria-pressed="${root === trendDomain}">看趋势</button></td>
       <td class="num">${bytes(item.rx_bytes)}</td><td class="num">${bytes(item.tx_bytes)}</td>
       <td class="num"><strong>${bytes(item.total_bytes)}</strong></td>
       <td><span class="share"><progress max="100" value="${share.toFixed(2)}" aria-label="流量占比"></progress>${share.toFixed(1)}%</span></td>
@@ -385,10 +399,108 @@ function regionName(code) {
   return code ? regionNames.of(code) : '未知地区';
 }
 
+let mapGeometry;
+let mapLoading = false;
+let mapRegions = [];
+let mapShapePaths = [];
+let mapPointPaths = [];
+let focusedRegion = null;
+
+function regionHeat(count, max) {
+  return 0.66 * Math.sqrt(count / Math.max(1, max));
+}
+
+async function renderSourceMap(regions) {
+  mapRegions = regions ?? [];
+  if (!mapRegions.length) {
+    $('sourceMap').hidden = true;
+    return;
+  }
+  if (!mapGeometry && !mapLoading) {
+    mapLoading = true;
+    try {
+      mapGeometry = await fetchJson('/world-map.json');
+      mapShapePaths = mapGeometry.countries.map(([code, rings]) => {
+        const path = new Path2D();
+        for (const coords of rings) {
+          path.moveTo(coords[0], coords[1]);
+          for (let i = 2; i < coords.length; i += 2) path.lineTo(coords[i], coords[i + 1]);
+          path.closePath();
+        }
+        return [code, path];
+      });
+      mapPointPaths = mapGeometry.points.map(([code, x, y]) => {
+        const path = new Path2D();
+        path.arc(x, y, 4, 0, 2 * Math.PI);
+        return [code, path];
+      });
+    } catch {
+      mapGeometry = undefined;
+    } finally {
+      mapLoading = false;
+    }
+  }
+  if (!mapGeometry || !mapRegions.length) return;
+  $('sourceMap').hidden = false;
+  drawSourceMap();
+}
+
+function drawSourceMap() {
+  const canvas = $('sourceMapCanvas');
+  const ctx = canvas.getContext('2d');
+  if (!mapGeometry || !canvas.clientWidth || !ctx) return;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.round(canvas.clientWidth * ratio);
+  const height = Math.round(canvas.clientHeight * ratio);
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.setTransform(width / mapGeometry.size[0], 0, 0, height / mapGeometry.size[1], 0, 0);
+  const regions = new Map(mapRegions.filter(r => r.country_code).map(r => [r.country_code, r.total_bytes]));
+  const max = mapRegions[0]?.total_bytes ?? 0;
+  for (const [code, path] of [...mapShapePaths, ...mapPointPaths.filter(([id]) => regions.has(id))]) {
+    const heat = regionHeat(regions.get(code) ?? 0, max);
+    ctx.fillStyle = heat
+      ? `rgb(${Math.round(244 - 174 * heat)}, ${Math.round(250 - 62 * heat)}, ${Math.round(247 - 98 * heat)})`
+      : '#e1e9e6';
+    ctx.fill(path, 'evenodd');
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#a8bbb1';
+    ctx.stroke(path);
+  }
+}
+
+function describeSourceMap(event) {
+  if (!mapGeometry) return;
+  const canvas = $('sourceMapCanvas');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (event.clientX - rect.left) * mapGeometry.size[0] / rect.width;
+  const y = (event.clientY - rect.top) * mapGeometry.size[1] / rect.height;
+  const data = new Map(mapRegions.filter(r => r.country_code).map(r => [r.country_code, r]));
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const hit = [...mapPointPaths, ...mapShapePaths]
+    .find(([code, path]) => data.has(code) && ctx.isPointInPath(path, x, y, 'evenodd'));
+  ctx.restore();
+  const code = hit?.[0] ?? null;
+  if (code === focusedRegion) return;
+  focusedRegion = code;
+  const region = data.get(code);
+  setText('sourceMapDetail', region
+    ? `${regionName(code)} · ${number(region.unique_ips)} 个 IP · ${bytes(region.total_bytes)}`
+    : '指向或点按地区查看流量');
+}
+
 function renderSourceGeography(data) {
   const regions = data.regions;
   $('sourceGeography').hidden = !regions;
+  renderSourceMap(regions);
   if (!regions) return;
+  focusedRegion = null;
+  setText('sourceMapDetail', '指向或点按地区查看流量');
   $('sourceGeoEmpty').hidden = regions.length > 0;
   setText('sourceGeoCaption', regions.length > 8
     ? '显示流量前 8 个地区，颜色越深总流量越大'
@@ -398,7 +510,7 @@ function renderSourceGeography(data) {
   $('sourceGeoList').innerHTML = regions.slice(0, 8).map(region => {
     const label = regionName(region.country_code);
     const share = totalBytes ? 100 * region.total_bytes / totalBytes : 0;
-    const heat = 66 * Math.sqrt(region.total_bytes / maxBytes);
+    const heat = 100 * regionHeat(region.total_bytes, maxBytes);
     return `<li style="--heat:${heat.toFixed(1)}%"><div><strong>${esc(label)}</strong><strong>${bytes(region.total_bytes)}</strong></div>
       <small>${number(region.unique_ips)} 个 IP · ${share.toFixed(1)}%</small></li>`;
   }).join('');
@@ -540,11 +652,32 @@ $('sourceFilter').addEventListener('input', () => {
 });
 
 $('domainsBody').addEventListener('click', (event) => {
+  const trend = event.target.closest('[data-trend-root]');
+  if (trend) {
+    trendDomain = trend.dataset.trendRoot;
+    domainTimeline = [];
+    refresh();
+    $('trendTitle').scrollIntoView({ block: 'center' });
+    return;
+  }
   const button = event.target.closest('[data-root]');
   if (!button) return;
   state.expandedRoot = state.expandedRoot === button.dataset.root ? null : button.dataset.root;
   renderDomains();
 });
+
+$('resetTrendDomain').addEventListener('click', () => {
+  trendDomain = null;
+  renderCurrentChart();
+  refresh();
+});
+$('sourceMapCanvas').addEventListener('pointermove', describeSourceMap);
+$('sourceMapCanvas').addEventListener('pointerdown', describeSourceMap);
+$('sourceMapCanvas').addEventListener('pointerleave', () => {
+  focusedRegion = null;
+  setText('sourceMapDetail', '指向或点按地区查看流量');
+});
+new ResizeObserver(drawSourceMap).observe($('sourceMapCanvas'));
 
 $('drillBadge').addEventListener('click', () => {
   state.drill = null;
@@ -579,7 +712,7 @@ timelineSvg.addEventListener('keydown', (event) => {
 });
 
 new ResizeObserver(() => {
-  if (state.view === 'overview' && state.overview) renderChart(state.overview);
+  if (state.view === 'overview' && state.overview) renderCurrentChart();
 }).observe($('chartBox'));
 
 addEventListener('hashchange', showView);

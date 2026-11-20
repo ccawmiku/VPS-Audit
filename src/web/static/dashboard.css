@@ -336,6 +336,14 @@ tr.rank-row:hover, tr.rank-row:focus-within { background: #f6fbf8; }
 .geo-rank li small, .source-location { color: var(--muted); font-size: 11px; }
 .source-location { display: block; margin-top: 2px; }
 .geo-empty { padding: 0 16px 14px; margin: 0; color: var(--muted); font-size: 12px; }
+.source-map { margin: 0 16px 14px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #f1f7f4; }
+.source-map canvas { width: 100%; height: auto; aspect-ratio: 1080 / 426; display: block; }
+.source-map-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 8px 11px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--line); }
+.source-map-footer > span { display: flex; align-items: center; gap: 6px; }
+.source-map-scale { width: 64px; height: 7px; border-radius: 7px; background: linear-gradient(90deg, #f4faf7, #81d1b6); }
+.trend-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.domain-trend { margin: 0 0 0 6px; padding: 2px 5px; border: 1px solid #cfdfd7; border-radius: 5px; background: var(--surface); color: var(--accent); font: inherit; font-size: 11px; white-space: nowrap; cursor: pointer; }
+.domain-trend:hover, .domain-trend[aria-pressed="true"] { background: #d8f2e8; border-color: #82bba7; }
 .empty { padding: 27px 15px; color: var(--subtle); text-align: center; }
 .empty .icon { display: block; width: 24px; height: 24px; margin: 0 auto 6px; color: #75948a; }
 .scope-note { display: flex; align-items: flex-start; gap: 7px; margin: 13px 2px 0; font-size: 12px; color: var(--muted); }

@@ -242,7 +242,10 @@ SOFTWARE.
             <section class="panel chart-panel" aria-labelledby="trendTitle">
               <header class="panel-head">
                 <div><h2 id="trendTitle">流量趋势</h2><p id="stepLabel">按时段汇总 TCP 负载</p></div>
-                <div class="legend"><span><i class="dot rx"></i>下行</span><span><i class="dot tx"></i>上行</span></div>
+                <div class="trend-controls">
+                  <div class="legend"><span><i class="dot rx"></i>下行</span><span><i class="dot tx"></i>上行</span></div>
+                  <button type="button" class="button" id="resetTrendDomain" hidden>看全站</button>
+                </div>
               </header>
               <div class="chart-box" id="chartBox">
                 <svg id="timelineSvg" aria-label="分时段流量趋势，左右方向键选择时段，回车可查看该时段" tabindex="0"></svg>
@@ -315,6 +318,14 @@ SOFTWARE.
               <div><h2 id="sourceGeoTitle">来源地区分布</h2><p id="sourceGeoCaption">颜色越深，当前时段的总流量越大</p></div>
               <a class="geo-credit" href="https://db-ip.com/" target="_blank" rel="noopener noreferrer">IP Geolocation by DB-IP</a>
             </div>
+            <figure class="source-map" id="sourceMap" hidden>
+              <canvas id="sourceMapCanvas" width="1080" height="426" role="img" aria-label="世界地图，按来源地区的总流量着色"></canvas>
+              <figcaption class="source-map-footer">
+                <span>低 <i class="source-map-scale" aria-hidden="true"></i> 高</span>
+                <output id="sourceMapDetail" aria-live="polite">指向或点按地区查看流量</output>
+                <a class="geo-credit" href="https://www.naturalearthdata.com/" target="_blank" rel="noopener noreferrer">Natural Earth</a>
+              </figcaption>
+            </figure>
             <ul id="sourceGeoList" class="geo-rank"></ul>
             <p id="sourceGeoEmpty" class="geo-empty" hidden>此时段暂无来源 IP</p>
           </section>

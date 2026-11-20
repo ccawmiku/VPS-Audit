@@ -1,8 +1,8 @@
 use crate::collector::{BUCKET_SECONDS, CollectorStatus, unix_now};
 use crate::geo::CountryDb;
 use crate::storage::sqlite::{
-    SourcesResponse, db_size_bytes, query_domain_details, query_overview, query_recent,
-    query_sources,
+    SourcesResponse, TimelinePoint, db_size_bytes, query_domain_details, query_domain_timeline,
+    query_overview, query_recent, query_sources,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -58,9 +58,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/dashboard.css", get(serve_stylesheet))
         .route("/dashboard.js", get(serve_script))
+        .route("/world-map.json", get(serve_world_map))
         .route("/healthz", get(healthz))
         .route("/api/overview", get(api_overview))
         .route("/api/domain/{root}/details", get(api_domain_details))
+        .route("/api/domain/{root}/timeline", get(api_domain_timeline))
         .route("/api/recent", get(api_recent))
         .route("/api/sources", get(api_sources))
         .route("/api/status", get(api_status))
@@ -94,6 +96,10 @@ async fn serve_stylesheet() -> Response {
 
 async fn serve_script() -> Response {
     serve_asset("dashboard.js", "text/javascript; charset=utf-8")
+}
+
+async fn serve_world_map() -> Response {
+    serve_asset("world-map.json", "application/json")
 }
 
 fn serve_asset(path: &str, content_type: &'static str) -> Response {
@@ -173,6 +179,21 @@ async fn api_sources(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(res))
+}
+
+async fn api_domain_timeline(
+    State(state): State<AppState>,
+    Path(root): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<Vec<TimelinePoint>>, (StatusCode, String)> {
+    let (from, to, step) = normalize_range(&q);
+    tokio::task::spawn_blocking(move || {
+        query_domain_timeline(&state.db_path, &root, from, to, step)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {

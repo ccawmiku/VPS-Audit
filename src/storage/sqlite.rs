@@ -445,39 +445,7 @@ pub fn query_overview(
         })
         .collect();
 
-    // 2. Time-series rollup
-    let mut stmt_tl = snapshot.prepare(
-        r#"
-        SELECT
-            (bucket_ts / ?3) * ?3 AS slot_ts,
-            COALESCE(SUM(tx_bytes), 0) AS tx,
-            COALESCE(SUM(rx_bytes), 0) AS rx,
-            COALESCE(SUM(CASE WHEN root_domain = ?4 THEN tx_bytes + rx_bytes ELSE 0 END), 0) AS unid,
-            COALESCE(SUM(conn_count), 0) AS conns
-        FROM traffic_buckets
-        WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
-        GROUP BY slot_ts
-        ORDER BY slot_ts ASC
-        "#,
-    )?;
-
-    let tl_rows = stmt_tl.query_map(
-        params![from_bucket, to_bucket, step, UNIDENTIFIED_DOMAIN],
-        |row| {
-            Ok(TimelinePoint {
-                ts: row.get(0)?,
-                tx_bytes: row.get::<_, i64>(1)?.max(0) as u64,
-                rx_bytes: row.get::<_, i64>(2)?.max(0) as u64,
-                unidentified_bytes: row.get::<_, i64>(3)?.max(0) as u64,
-                conn_count: row.get::<_, i64>(4)?.max(0) as u64,
-            })
-        },
-    )?;
-
-    let mut timeline = Vec::new();
-    for item in tl_rows {
-        timeline.push(item?);
-    }
+    let timeline = read_timeline(&snapshot, from_bucket, to_bucket, step, None)?;
 
     let unidentified_ratio_pct = if total_tx + total_rx == 0 {
         0.0
@@ -502,6 +470,70 @@ pub fn query_overview(
         domains,
         traffic_types,
     })
+}
+
+pub fn query_domain_timeline(
+    db_path: &Path,
+    root_domain: &str,
+    from_ts: i64,
+    to_ts: i64,
+    step: i64,
+) -> rusqlite::Result<Vec<TimelinePoint>> {
+    read_timeline(
+        &open_ro(db_path)?,
+        align_bucket(from_ts),
+        align_bucket(to_ts),
+        step,
+        Some(root_domain),
+    )
+}
+
+fn read_timeline(
+    conn: &Connection,
+    from_bucket: i64,
+    to_bucket: i64,
+    step: i64,
+    root_domain: Option<&str>,
+) -> rusqlite::Result<Vec<TimelinePoint>> {
+    let filter = if root_domain.is_some() {
+        "AND root_domain = ?5"
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        SELECT
+            (bucket_ts / ?3) * ?3 AS slot_ts,
+            COALESCE(SUM(tx_bytes), 0) AS tx,
+            COALESCE(SUM(rx_bytes), 0) AS rx,
+            COALESCE(SUM(CASE WHEN root_domain = ?4 THEN tx_bytes + rx_bytes ELSE 0 END), 0) AS unid,
+            COALESCE(SUM(conn_count), 0) AS conns
+        FROM traffic_buckets
+        WHERE bucket_ts BETWEEN ?1 AND ?2 {filter}
+        GROUP BY slot_ts
+        ORDER BY slot_ts ASC
+        "#,
+    ))?;
+    let step = step.max(300);
+    let mut args = vec![
+        &from_bucket as &dyn rusqlite::ToSql,
+        &to_bucket,
+        &step,
+        &UNIDENTIFIED_DOMAIN,
+    ];
+    if let Some(domain) = &root_domain {
+        args.push(domain);
+    }
+    stmt.query_map(args.as_slice(), |row| {
+        Ok(TimelinePoint {
+            ts: row.get(0)?,
+            tx_bytes: row.get::<_, i64>(1)?.max(0) as u64,
+            rx_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            unidentified_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+            conn_count: row.get::<_, i64>(4)?.max(0) as u64,
+        })
+    })?
+    .collect()
 }
 
 pub fn query_domain_details(
@@ -800,6 +832,14 @@ mod tests {
         assert_eq!(ov.summary.unidentified_tx_bytes, 500);
         assert_eq!(ov.domains[0].root_domain, "youtube.com");
         assert_eq!(ov.domains[0].service_label, Some("YouTube"));
+        let series = query_domain_timeline(&db_path, "youtube.com", bts, bts + 300, 300).unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!((series[0].tx_bytes, series[0].rx_bytes), (1_000, 50_000));
+        assert!(
+            query_domain_timeline(&db_path, "missing.example", bts, bts + 300, 300)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             ov.traffic_types
                 .iter()
