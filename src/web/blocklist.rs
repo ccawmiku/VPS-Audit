@@ -1,12 +1,14 @@
-use crate::collector::CollectorStatus;
+use crate::collector::{CollectorStatus, unix_now};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const REQUEST: &str = "/var/lib/vless-audit/blocklist-request";
 const REPORT: &str = "/var/lib/vless-audit-blocklist/status.json";
+const DROP_HITS: &str = "/var/lib/vless-audit-blocklist/drop-hits.json";
 
 #[derive(Debug, Deserialize)]
 struct FirewallReport {
@@ -18,6 +20,7 @@ struct FirewallReport {
     ipv4_ranges: u64,
     ipv6_ranges: u64,
     warning: Option<String>,
+    tracking_since: Option<i64>,
 }
 
 #[derive(Serialize, Default)]
@@ -31,6 +34,22 @@ pub struct BlocklistStatus {
     pub ipv4_ranges: u64,
     pub ipv6_ranges: u64,
     pub warning: Option<String>,
+    #[serde(skip)]
+    tracking_since: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct DropHits {
+    tracking_since: i64,
+    collected_at: i64,
+    at_capacity: bool,
+    rows: Vec<DropHit>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DropHit {
+    ip: IpAddr,
+    last_seen: i64,
 }
 
 pub fn status(collector: &CollectorStatus) -> BlocklistStatus {
@@ -60,7 +79,26 @@ pub fn status(collector: &CollectorStatus) -> BlocklistStatus {
         ipv4_ranges: report.ipv4_ranges,
         ipv6_ranges: report.ipv6_ranges,
         warning: report.warning,
+        tracking_since: report.tracking_since,
     }
+}
+
+pub fn drop_hits(collector: &CollectorStatus) -> Option<DropHits> {
+    let status = status(collector);
+    if !status.installed || !status.active {
+        return None;
+    }
+    let file = File::open(DROP_HITS).ok()?;
+    let mut snapshot: DropHits =
+        serde_json::from_reader(BufReader::new(file.take(1024 * 1024))).ok()?;
+    let now = unix_now();
+    if Some(snapshot.tracking_since) != status.tracking_since
+        || !(now - 90..=now).contains(&snapshot.collected_at)
+    {
+        return None;
+    }
+    snapshot.rows.retain(|hit| hit.last_seen >= now - 86400);
+    Some(snapshot)
 }
 
 pub fn set_enabled(enabled: bool) -> io::Result<()> {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile the optional Spamhaus DROP input rules for vless-audit."""
+"""Reconcile Spamhaus DROP input rules and publish their observed hits."""
 
 import ipaddress
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.request import urlopen
@@ -17,6 +18,9 @@ REQUEST = Path("/var/lib/vless-audit/blocklist-request")
 STATE = Path("/var/lib/vless-audit-blocklist")
 NFT = "/usr/sbin/nft"
 TABLE = "vless_audit_drop"
+HIT_SETS = {4: "hits_v4", 6: "hits_v6"}
+HIT_TTL = 86400
+HIT_LIMIT = 4096
 SOURCES = {
     4: "https://www.spamhaus.org/drop/drop_v4.json",
     6: "https://www.spamhaus.org/drop/drop_v6.json",
@@ -41,15 +45,24 @@ def write_json(path, value, mode=0o600):
         Path(name).unlink(missing_ok=True)
 
 
-def requested():
+def read_audit_file(path, limit):
     try:
-        fd = os.open(REQUEST, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return False
+        return None
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("Invalid request file")
-        content = stream.read(8)
+        content = stream.read(limit + 1)
+    if len(content) > limit:
+        raise ValueError("Audit control file exceeds size limit")
+    return content
+
+
+def requested():
+    content = read_audit_file(REQUEST, 8)
+    if content is None:
+        return False
     if content not in (b"on\n", b"off\n"):
         raise ValueError("Invalid blocklist request")
     return content == b"on\n"
@@ -118,32 +131,70 @@ def nft_apply(rules):
         raise RuntimeError(p.stderr.strip())
 
 
-def table_active():
-    return subprocess.run(
-        [NFT, "list", "table", "inet", TABLE],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-    ).returncode == 0
+def drop_sets(*options):
+    result = subprocess.run(
+        [NFT, "-j", *options, "list", "table", "inet", TABLE],
+        capture_output=True, check=True, timeout=10,
+    )
+    return {item["set"]["name"]: item["set"] for item in json.loads(result.stdout)["nftables"] if "set" in item}
 
 
 def ruleset(iface, ports, cache):
     prefix = f"inet {TABLE}"
     lines = [
-        f"destroy table {prefix}",
         f"add table {prefix}",
         f"add chain {prefix} incoming {{ type filter hook input priority -5; policy accept; }}",
+        f"flush chain {prefix} incoming",
     ]
     port_set = ", ".join(map(str, ports))
     for version, protocol in [(4, "ip"), (6, "ip6")]:
         name = f"targets_v{version}"
+        hits = HIT_SETS[version]
+        match = f'iifname "{iface}" tcp dport {{ {port_set} }} {protocol} saddr @{name}'
         lines.extend([
             f"add set {prefix} {name} {{ type ipv{version}_addr; flags interval; auto-merge; }}",
+            f"flush set {prefix} {name}",
             f"add element {prefix} {name} {{ {', '.join(cache[f'v{version}'])} }}",
-            f'add rule {prefix} incoming iifname "{iface}" tcp dport {{ {port_set} }} {protocol} saddr @{name} counter drop',
+            f"add set {prefix} {hits} {{ type ipv{version}_addr; flags dynamic,timeout; timeout {HIT_TTL}s; size {HIT_LIMIT}; }}",
+            # The drop rule still runs if the hit set is full and cannot take a new IP.
+            f"add rule {prefix} incoming {match} update @{hits} {{ {protocol} saddr }}",
+            f"add rule {prefix} incoming {match} counter drop",
         ])
     return "\n".join(lines) + "\n"
 
 
-def main():
+def publish_drop_hits():
+    path = STATE / "drop-hits.json"
+    report = read_json(STATE / "status.json")
+    tracking_since = report.get("tracking_since")
+    if not report.get("active") or tracking_since is None:
+        path.unlink(missing_ok=True)
+        return
+    collected_at = int(time.time())
+    try:
+        sets = drop_sets()
+        rows = []
+        at_capacity = False
+        for version, name in HIT_SETS.items():
+            elements = sets[name].get("elem", [])
+            at_capacity |= len(elements) >= HIT_LIMIT
+            for item in elements:
+                element = item["elem"]
+                ip = ipaddress.ip_address(element["val"])
+                expires = element["expires"]
+                if ip.version == version and 0 < expires <= HIT_TTL:
+                    rows.append({"ip": str(ip), "last_seen": max(tracking_since, collected_at - HIT_TTL + expires)})
+        rows.sort(key=lambda row: (-row["last_seen"], row["ip"]))
+        write_json(path, {
+            "tracking_since": tracking_since, "collected_at": collected_at,
+            "at_capacity": at_capacity, "rows": rows,
+        }, 0o640)
+    except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"Could not collect Spamhaus DROP hits: {error}", flush=True)
+        raise SystemExit(1) from None
+
+
+def apply_spamhaus():
     report_path = STATE / "status.json"
     previous = read_json(report_path)
     report = {
@@ -151,7 +202,7 @@ def main():
         "updated_at": previous.get("updated_at"),
         "ipv4_ranges": previous.get("ipv4_ranges", 0),
         "ipv6_ranges": previous.get("ipv6_ranges", 0),
-        "warning": None,
+        "warning": None, "tracking_since": None,
     }
     try:
         enabled = requested()
@@ -169,24 +220,35 @@ def main():
             if not cache:
                 report["warning"] = "no_feed"
             else:
+                try:
+                    sets = drop_sets("-t")
+                except subprocess.CalledProcessError:
+                    sets = {}
+                tracking_since = previous.get("tracking_since")
+                tracking = tracking_since is not None and all(name in sets for name in HIT_SETS.values())
                 if (
                     not previous.get("active")
                     or previous.get("updated_at") != cache["updated_at"]
                     or previous.get("interface") != report["interface"]
                     or previous.get("ports") != report["ports"]
-                    or not table_active()
+                    or not tracking
                 ):
                     nft_apply(ruleset(report["interface"], report["ports"], cache))
                 report.update(
                     active=True, updated_at=cache["updated_at"],
                     ipv4_ranges=len(cache["v4"]), ipv6_ranges=len(cache["v6"]),
                     warning="stale_feed" if stale else None,
+                    tracking_since=tracking_since if tracking else int(time.time()),
                 )
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+    except (OSError, KeyError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Firewall reconciliation failed: {error}", flush=True)
-        report.update(active=previous.get("active", False), warning="firewall_error")
+        report.update(active=previous.get("active", False), warning="firewall_error",
+                      tracking_since=previous.get("tracking_since"))
     write_json(report_path, report, 0o644)
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--drop-hits"]:
+        publish_drop_hits()
+    else:
+        apply_spamhaus()

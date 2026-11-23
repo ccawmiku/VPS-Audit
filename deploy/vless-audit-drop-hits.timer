@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Spamhaus DROP hits for vless-audit
+
+[Timer]
+OnBootSec=40s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

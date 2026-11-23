@@ -300,7 +300,17 @@ SOFTWARE.
               <h2 id="blocklistTitle">入站 IP 屏蔽</h2>
               <p id="blocklistStatus" role="status">正在读取防火墙状态</p>
             </div>
-            <button type="button" class="button" id="blocklistToggle" role="switch" aria-checked="false" disabled>关闭</button>
+            <button type="button" class="button" id="blocklistToggle" role="switch" aria-label="Spamhaus DROP 屏蔽" aria-checked="false" disabled>关闭</button>
+            <details class="drop-hits" id="dropHits" hidden>
+              <summary>查看实际拦截的 IP</summary>
+              <p id="dropHitsStatus" role="status"></p>
+              <div class="table-scroll drop-hits-scroll" id="dropHitsTable" role="region" aria-label="Spamhaus DROP 实际拦截记录" tabindex="0" hidden>
+                <table>
+                  <thead><tr><th scope="col">来源 IP</th><th scope="col">最近拦截时间（北京时间）</th></tr></thead>
+                  <tbody id="dropHitsBody"></tbody>
+                </table>
+              </div>
+            </details>
           </section>
           <div class="metrics source-metrics">
             <article class="metric">

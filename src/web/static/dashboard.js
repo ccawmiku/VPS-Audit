@@ -34,6 +34,8 @@ let domainTimeline = [];
 let blocklistStatus;
 let blocklistSaving = false;
 let blocklistPoll;
+let dropHitsRequest;
+let dropHitsCollectedAt;
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -572,6 +574,38 @@ function renderBlocklist(info) {
     }, 2200);
   }
   setText('blocklistStatus', message);
+  $('dropHits').hidden = !info?.installed || !info.active;
+  if ($('dropHits').hidden) $('dropHits').open = false;
+  loadDropHits();
+}
+
+async function loadDropHits(showLoading = false) {
+  dropHitsRequest?.abort();
+  if ($('dropHits').hidden || !$('dropHits').open) return;
+  dropHitsRequest = new AbortController();
+  const { signal } = dropHitsRequest;
+  const table = $('dropHitsTable');
+  if (showLoading) {
+    table.hidden = true;
+    setText('dropHitsStatus', '正在读取拦截记录');
+  }
+  try {
+    const data = await fetchJson('/api/blocklist/hits', signal);
+    if (signal.aborted) return;
+    const count = data.rows.length;
+    const capacity = data.at_capacity ? ' · 记录已达容量上限' : '';
+    setText('dropHitsStatus', count ? `最近 24 小时拦截 ${number(count)} 个来源 IP${capacity}` : '最近 24 小时暂无拦截记录');
+    if (dropHitsCollectedAt !== data.collected_at || $('dropHitsBody').rows.length !== count) {
+      $('dropHitsBody').innerHTML = data.rows.map(({ ip, last_seen }) =>
+        `<tr><td class="mono">${esc(ip)}</td><td>${esc(time(last_seen))}</td></tr>`).join('');
+      dropHitsCollectedAt = data.collected_at;
+    }
+    table.hidden = count === 0;
+  } catch (error) {
+    if (signal.aborted) return;
+    table.hidden = true;
+    setText('dropHitsStatus', '暂时无法读取拦截记录，稍后自动刷新');
+  }
 }
 
 function setHealth(label, tone) {
@@ -697,6 +731,8 @@ $('blocklistToggle').addEventListener('click', async () => {
   }
   await refresh();
 });
+
+$('dropHits').addEventListener('toggle', () => loadDropHits(true));
 
 $('sourceFilter').addEventListener('input', () => {
   $('sourceError').hidden = true;

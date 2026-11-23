@@ -17,7 +17,7 @@ if [[ "$BLOCKLIST" == "--with-blocklist" ]]; then
     echo "Optional blocklist support requires nftables and Python 3." >&2
     exit 1
   fi
-  for file in vless-audit-blocklist{,.service,.path,.timer}; do
+  for file in vless-audit-blocklist{,.service,.path,.timer} vless-audit-drop-hits.{service,timer}; do
     if [[ ! -f "$DEPLOY_DIR/$file" ]]; then
       echo "Missing blocklist component: $DEPLOY_DIR/$file" >&2
       exit 1
@@ -39,6 +39,7 @@ if [[ "$BLOCKLIST" == "--with-blocklist" ]]; then
   install -d -m 0755 /usr/local/libexec
   install -m 0755 "$DEPLOY_DIR/vless-audit-blocklist" /usr/local/libexec/vless-audit-blocklist
   install -m 0644 "$DEPLOY_DIR"/vless-audit-blocklist.{service,path,timer} /etc/systemd/system/
+  install -m 0644 "$DEPLOY_DIR"/vless-audit-drop-hits.{service,timer} /etc/systemd/system/
 fi
 
 systemctl daemon-reload
@@ -49,7 +50,7 @@ for _ in $(seq 1 30); do
   if curl -fsS --max-time 2 "http://$LISTEN_ADDRESS/healthz" >/dev/null 2>&1; then
     if [[ "$BLOCKLIST" == "--with-blocklist" ]]; then
       systemctl start vless-audit-blocklist.service
-      systemctl enable --now vless-audit-blocklist.path vless-audit-blocklist.timer
+      systemctl enable --now vless-audit-blocklist.path vless-audit-blocklist.timer vless-audit-drop-hits.timer
     fi
     echo "Installed and running on $LISTEN_ADDRESS"
     exit 0

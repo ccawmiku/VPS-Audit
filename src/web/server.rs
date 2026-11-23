@@ -73,6 +73,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sources", get(api_sources))
         .route("/api/status", get(api_status))
         .route("/api/blocklist", post(api_set_blocklist))
+        .route("/api/blocklist/hits", get(api_drop_hits))
         .layer(axum::middleware::map_response(
             |mut response: Response| async {
                 response.headers_mut().insert(
@@ -201,6 +202,21 @@ async fn api_domain_timeline(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map(Json)
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn api_drop_hits(
+    State(state): State<AppState>,
+) -> Result<Json<blocklist::DropHits>, StatusCode> {
+    let collector = state
+        .status
+        .read()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .clone();
+    tokio::task::spawn_blocking(move || blocklist::drop_hits(&collector))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 async fn api_set_blocklist(

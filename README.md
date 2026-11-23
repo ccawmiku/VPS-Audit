@@ -59,10 +59,12 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" 
 
 ### 可选入站 IP 屏蔽
 
-Debian 13 可以随 Audit 安装可选的防火墙组件。它需要系统自带 Python 3 和 nftables，安装脚本旁需保留 `vless-audit-blocklist` 及其 `.service`、`.path`、`.timer` 文件。
+Debian 13 可以随 Audit 安装可选的防火墙组件。它需要系统自带 Python 3 和 nftables，安装脚本旁需保留 `vless-audit-blocklist` 及其 systemd 单元文件。
 
 ```bash
 sudo ./deploy/install.sh ./dist/vless-audit ./deploy/vless-audit.service 127.0.0.1:18080 --with-blocklist
 ```
 
 初次安装默认为关闭。在「来源 IP」页开启后，系统服务下载 [Spamhaus DROP](https://www.spamhaus.org/blocklists/do-not-route-or-peer/) 的 IPv4、IPv6 名单，只匹配 `VLESS_AUDIT_IFACE` 上发往 `VLESS_AUDIT_INBOUND_PORT` 的入站 TCP。接口和端口须与 Audit 的实际采集配置一致。其他防火墙规则照常执行。开启时每天刷新名单，下载或解析失败保留最近一次有效名单。关闭后移除 Audit 的专用防火墙表。
+
+屏蔽生效后，在「来源 IP → 入站 IP 屏蔽」展开「查看实际拦截的 IP」，可查看最近 24 小时内被 Spamhaus DROP 规则丢弃过入站 TCP 包的 IPv4、IPv6 来源地址。每个地址只显示一行和最近一次拦截时间，每 30 秒从 nftables 读取一次。每种地址最多保留 4096 个，关闭屏蔽或重启服务器后从空记录开始。已有安装用 `--with-blocklist` 重新运行上面的安装命令以启用采集定时器。
