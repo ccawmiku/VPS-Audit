@@ -310,3 +310,55 @@ async fn api_status(State(state): State<AppState>, headers: HeaderMap) -> Json<S
     })
 }
 use super::blocklist::{self, BlocklistStatus};
+
+#[cfg(test)]
+mod tests {
+    use super::{RangeQuery, normalize_range};
+    use crate::collector::{BUCKET_SECONDS, unix_now};
+
+    fn range(from: Option<i64>, to: Option<i64>, step: Option<i64>) -> (i64, i64, i64) {
+        normalize_range(&RangeQuery { from, to, step })
+    }
+
+    #[test]
+    fn defaults_to_the_last_day_in_bucket_steps() {
+        let before = unix_now();
+        let (from, to, step) = range(None, None, None);
+        let after = unix_now();
+        assert!((before..=after).contains(&to));
+        assert_eq!(to - from, 24 * 3600);
+        assert_eq!(step, BUCKET_SECONDS);
+    }
+
+    #[test]
+    fn clamps_inverted_negative_and_future_bounds() {
+        let now = unix_now();
+        let (from, to, _) = range(Some(now + 3600), Some(now + 3600), None);
+        assert_eq!(to, now);
+        assert_eq!(from, to);
+
+        let (from, to, _) = range(Some(-100), Some(now + 10), None);
+        assert_eq!(to, now);
+        assert_eq!(from, 0);
+    }
+
+    #[test]
+    fn switches_to_hourly_default_step_only_beyond_36_hours() {
+        let now = unix_now();
+        let (from, to, step) = range(Some(now - 48 * 3600), Some(now), None);
+        assert_eq!(to - from, 48 * 3600);
+        assert_eq!(step, 3600);
+
+        let (_, _, step) = range(Some(now - 36 * 3600), Some(now), None);
+        assert_eq!(step, BUCKET_SECONDS);
+    }
+
+    #[test]
+    fn clamps_and_aligns_explicit_step() {
+        let now = unix_now();
+        assert_eq!(range(Some(now - 3600), Some(now), Some(1)).2, BUCKET_SECONDS);
+        assert_eq!(range(Some(now - 3600), Some(now), Some(1000)).2, 900);
+        assert_eq!(range(Some(now - 3600), Some(now), Some(86_401)).2, 86_400);
+        assert_eq!(range(Some(now - 3600), Some(now), Some(600)).2, 600);
+    }
+}

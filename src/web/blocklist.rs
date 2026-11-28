@@ -83,6 +83,15 @@ pub fn status(collector: &CollectorStatus) -> BlocklistStatus {
     }
 }
 
+fn snapshot_is_fresh(snapshot: &DropHits, tracking_since: Option<i64>, now: i64) -> bool {
+    Some(snapshot.tracking_since) == tracking_since
+        && (now - 90..=now).contains(&snapshot.collected_at)
+}
+
+fn retain_recent_hits(rows: &mut Vec<DropHit>, now: i64) {
+    rows.retain(|hit| hit.last_seen >= now - 86400);
+}
+
 pub fn drop_hits(collector: &CollectorStatus) -> Option<DropHits> {
     let status = status(collector);
     if !status.installed || !status.active {
@@ -92,12 +101,10 @@ pub fn drop_hits(collector: &CollectorStatus) -> Option<DropHits> {
     let mut snapshot: DropHits =
         serde_json::from_reader(BufReader::new(file.take(1024 * 1024))).ok()?;
     let now = unix_now();
-    if Some(snapshot.tracking_since) != status.tracking_since
-        || !(now - 90..=now).contains(&snapshot.collected_at)
-    {
+    if !snapshot_is_fresh(&snapshot, status.tracking_since, now) {
         return None;
     }
-    snapshot.rows.retain(|hit| hit.last_seen >= now - 86400);
+    retain_recent_hits(&mut snapshot.rows, now);
     Some(snapshot)
 }
 
@@ -122,4 +129,69 @@ pub fn set_enabled(enabled: bool) -> io::Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn snapshot(tracking_since: i64, collected_at: i64, rows: Vec<DropHit>) -> DropHits {
+        DropHits {
+            tracking_since,
+            collected_at,
+            at_capacity: false,
+            rows,
+        }
+    }
+
+    fn hit(ip: &str, last_seen: i64) -> DropHit {
+        DropHit {
+            ip: ip.parse().expect("test address"),
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn snapshot_freshness_requires_matching_tracking_and_recent_collection() {
+        let fresh = snapshot(7, NOW, vec![]);
+        assert!(snapshot_is_fresh(&fresh, Some(7), NOW));
+        assert!(snapshot_is_fresh(&fresh, Some(7), NOW + 90));
+        assert!(!snapshot_is_fresh(&fresh, Some(7), NOW + 91));
+        assert!(!snapshot_is_fresh(&fresh, None, NOW));
+        assert!(!snapshot_is_fresh(&fresh, Some(8), NOW));
+        assert!(!snapshot_is_fresh(
+            &snapshot(7, NOW + 1, vec![]),
+            Some(7),
+            NOW
+        ));
+    }
+
+    #[test]
+    fn drop_hit_rows_keep_the_24_hour_boundary() {
+        let mut rows = vec![
+            hit("192.0.2.1", NOW - 86_400),
+            hit("192.0.2.2", NOW - 86_401),
+            hit("2001:db8::1", NOW),
+        ];
+        retain_recent_hits(&mut rows, NOW);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ip, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(rows[0].last_seen, NOW - 86_400);
+        assert_eq!(rows[1].ip, IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn drop_hits_json_matches_the_python_writer_contract() {
+        let json = br#"{"tracking_since":5,"collected_at":6,"at_capacity":true,"rows":[{"ip":"192.0.2.1","last_seen":7},{"ip":"2001:db8::1","last_seen":8}]}"#;
+        let parsed: DropHits = serde_json::from_slice(json).expect("valid snapshot");
+        assert_eq!(parsed.tracking_since, 5);
+        assert_eq!(parsed.collected_at, 6);
+        assert!(parsed.at_capacity);
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[1].ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(parsed.rows[1].last_seen, 8);
+    }
 }
